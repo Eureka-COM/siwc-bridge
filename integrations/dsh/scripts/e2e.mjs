@@ -1,6 +1,6 @@
 // Real-account end-to-end checks through a headless DSH profile with the installed plugin.
 // Uses the signed-in ChatGPT plan: every scenario sends real requests. Run only when intended:
-//   node scripts/e2e.mjs [scenario ...]        (default: all: text tool continue switch compact search effort multitool subagent long)
+//   node scripts/e2e.mjs [scenario ...]        (default: all: text tool continue switch search effort multitool subagent long)
 // Writes full run events to .work/e2e/<time>/ (test prompts only) and prints a summary.
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -70,7 +70,7 @@ const check = (result, ok, detail) => { result.pass = ok; if (detail) result.det
 await install();
 if (want('text')) { const r = await turn('text', '日本語で「動作確認OK」とだけ返してください。', { model }); check(r, r.exitCode === 0 && r.final.includes('動作確認OK')); }
 let toolSession;
-if (want('tool') || want('continue') || want('switch') || want('compact')) {
+if (want('tool') || want('continue') || want('switch')) {
   const r = await turn('tool', `ファイル ${markerFile} を読み、書かれている value の値だけを返してください。`, { model });
   toolSession = r.session; check(r, r.exitCode === 0 && r.final.includes(marker) && r.tools.length > 0);
 }
@@ -81,15 +81,6 @@ if (want('continue') && toolSession) {
 if (want('switch') && toolSession && otherModel) {
   const r = await turn('switch', 'この会話で読んだファイルの value の値をもう一度だけ返してください。', { model: otherModel, sessionId: toolSession });
   check(r, r.exitCode === 0 && r.final.includes(marker), `model=${otherModel}`);
-}
-if (want('compact') && toolSession) {
-  // DSH's own /compact summarises the conversation through the same ChatGPT-plan model; the value must survive it.
-  const { diskDiagnostics: diagnosticsLog } = await import('../lib/diagnostics.js');
-  const since = new Date().toISOString();
-  const compacted = await turn('compact', '/compact', { model, sessionId: toolSession });
-  const summarised = (await diagnosticsLog().tail(50)).some(line => line.slice(0, 24) >= since && /kind=inference/.test(line) && /purpose=compaction/.test(line) && /outcome=ok/.test(line));
-  const r = await turn('after-compact', 'この会話で読んだファイルの value の値をもう一度だけ返してください。', { model, sessionId: toolSession });
-  check({ ...r, name: 'compact' }, compacted.exitCode === 0 && summarised && r.exitCode === 0 && r.final.includes(marker), `compactExit=${compacted.exitCode} summarised=${summarised}`);
 }
 if (want('search')) {
   // DSH's own web_search tool, answered through the ChatGPT plan (no DeepSeek key).

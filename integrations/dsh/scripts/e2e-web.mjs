@@ -68,6 +68,13 @@ function api(server) {
       if (!body?.result?.ok) throw new Error(`${endpoint}: ${JSON.stringify(body?.result?.error ?? body).slice(0, 300)}`);
       return body.result.value;
     },
+    /** A remote whose arguments are not wrapped in one request object (for example commands/execute). */
+    async call(endpoint, args) {
+      const response = await fetch(`${server.origin}/api/${endpoint}`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId: randomUUID(), method: endpoint, payload: { args } }) });
+      const body = await response.json();
+      if (!body?.result?.ok) throw new Error(`${endpoint}: ${JSON.stringify(body?.result?.error ?? body).slice(0, 300)}`);
+      return body.result.value;
+    },
     async upload(sessionId, name, bytes) {
       const response = await fetch(`${server.origin}/api/session/uploadFileBinary?${new URLSearchParams({ sessionId, name })}`, { method: 'POST', headers: { ...headers, 'content-type': 'application/octet-stream' }, body: bytes });
       const body = await response.json();
@@ -161,6 +168,26 @@ try {
     const result = await ask(sessionId, [{ type: 'text', text: '画像の色（日本語一語）と、ファイルに書かれた code の値を「色,値」の形で答えてください。' },
       { type: 'image', mediaType: 'image/png', data: png(30, 160, 60).toString('base64'), name: 'green.png' }, { type: 'file', receiptId: receipt.receiptId }], 0);
     check('image-and-file', result, result.reason === 'completed' && /緑|green/i.test(result.text) && result.text.includes(marker));
+  }
+
+  if (want('compact')) {
+    // DSH's own /compact (the command the UI runs) summarises through the same ChatGPT-plan model; the fact must survive it.
+    const { sessionId } = await client.rpc('session/create', { cwd: workspace });
+    const marker = randomBytes(5).toString('hex');
+    let first = await ask(sessionId, [{ type: 'text', text: `合言葉は ${marker} です。覚えておいて、「了解」とだけ返してください。` }], 0);
+    // A few more turns so there is history before the latest turn to condense.
+    for (const question of ['12×12は？数字だけ返してください。', '日本の首都は？一語で返してください。']) {
+      const next = await ask(sessionId, [{ type: 'text', text: question }], first.turns);
+      first = { ...next, reason: first.reason === 'completed' && next.reason === 'completed' ? 'completed' : next.reason };
+    }
+    const since = new Date().toISOString();
+    const started = Date.now();
+    const command = await client.call('commands/execute', { agentId: sessionId, line: '/compact', submittedAttachments: [] });
+    const { diskDiagnostics } = await import('../lib/diagnostics.js');
+    const summarised = (await diskDiagnostics().tail(50)).some(line => line.slice(0, 24) >= since && /purpose=compaction/.test(line) && /outcome=ok/.test(line));
+    check('compact', { reason: command?.result?.kind, seconds: Math.round((Date.now() - started) / 100) / 10, text: command?.result?.text ?? '' }, first.reason === 'completed' && command?.result?.kind === 'success' && /^Compacted /.test(command?.result?.text ?? '') && summarised, { summarised });
+    const after = await ask(sessionId, [{ type: 'text', text: '合言葉は何でしたか。合言葉だけを返してください。' }], first.turns);
+    check('after-compact', after, after.reason === 'completed' && after.text.includes(marker));
   }
 
   if (want('cancel')) {
