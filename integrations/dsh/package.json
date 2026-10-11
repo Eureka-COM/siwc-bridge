@@ -1,0 +1,37 @@
+{
+  "name": "dsh-siwc-bridge",
+  "version": "0.2.1",
+  "description": "Personal Windows dsh adapter using OpenAI's public SIWC protocol",
+  "type": "module",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "exports": { ".": "./lib/index.js", "./web-credentials": "./lib/web-credentials.js" },
+  "bin": { "dsh-siwc": "lib/cli.js" },
+  "files": ["lib/", "scripts/dpapi.ps1", "cordis.patch.yml", "README.md", "docs/", "LICENSE", "NOTICE"],
+  "engines": { "node": ">=24.0.0" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --test-concurrency=1 tests/*.test.ts",
+    "setup": "node scripts/setup.mjs",
+    "start": "node scripts/start.mjs",
+    "live-test": "node scripts/live-test.mjs",
+    "remove:plugin": "node scripts/uninstall.mjs",
+    "release:local": "node scripts/release.mjs",
+    "check:publication": "node scripts/release.mjs --check-only"
+  },
+  "dependencies": { "jose": "6.2.12" },
+  "overrides": { "@modelcontextprotocol/client": "2.2.0", "fflate": "0.8.3" },
+  "peerDependencies": { "@deepseek-ai/cordis": "4.0.5-alpha.1", "@deepseek-ai/dsh-llm": "0.2.1-alpha.1", "@deepseek-ai/dsh-agent": "0.2.1-alpha.1", "@deepseek-ai/dsh-commands": "0.2.1-alpha.1", "@deepseek-ai/dsh-credentials": "0.2.1-alpha.1" },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@deepseek-ai/dsh-llm": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-agent": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-commands": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-credentials": "0.2.1-alpha.1",
+    "@types/node": "24.19.1",
+    "typescript": "5.9.3"
+  }
+}

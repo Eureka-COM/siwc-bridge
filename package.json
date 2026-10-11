@@ -1,0 +1,24 @@
+{
+  "name": "siwc-bridge",
+  "version": "0.2.1",
+  "description": "Independent Windows SIWC client for local Node.js harnesses",
+  "type": "module",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": { ".": { "types": "./lib/index.d.ts", "import": "./lib/index.js" } },
+  "bin": { "siwc-bridge": "lib/cli.js" },
+  "files": ["lib/", "scripts/dpapi.ps1", "README.md", "docs/", "LICENSE", "NOTICE"],
+  "engines": { "node": ">=24.0.0" },
+  "repository": { "type": "git", "url": "git+https://github.com/Eureka-COM/siwc-bridge.git" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --test-concurrency=1 tests/*.test.ts",
+    "example:mock": "node examples/tool-roundtrip.mjs --mock",
+    "release:local": "node scripts/release.mjs",
+    "check:publication": "node scripts/release.mjs --check-only"
+  },
+  "dependencies": { "jose": "6.2.12" },
+  "devDependencies": { "@types/node": "24.19.1", "typescript": "5.9.3" }
+}

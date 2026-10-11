@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 脆弱性・資格情報に関わる報告 / Security report
+    url: https://github.com/Eureka-COM/siwc-bridge/security/advisories/new
+    about: 公開Issueではなく、非公開の脆弱性報告を使ってください。Use private vulnerability reporting.
+  - name: ChatGPT・利用枠・請求の問い合わせ / ChatGPT plan or billing
+    url: https://help.openai.com/
+    about: プランや請求はOpenAIへ問い合わせてください。This project cannot see your account.

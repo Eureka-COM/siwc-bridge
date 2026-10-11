@@ -1,0 +1,3 @@
+- insert:
+    - id: siwc-adapter
+      name: dsh-siwc-bridge

@@ -1,0 +1,33 @@
+siwc-bridge
+Copyright (c) 2026 EuReKa
+
+The independently authored source code in this repository is distributed
+under the MIT License in LICENSE. This notice does not grant rights to
+third-party code, OpenAI services, names, trademarks, logos, or design assets.
+
+This is an independent implementation of the published Sign in with ChatGPT
+OAuth/OIDC and Responses protocol. It is not an official OpenAI product and
+does not imply OpenAI sponsorship or endorsement. The applicable OpenAI
+service terms govern use of those services separately from this source license.
+
+The reusable SDK is for app-specific, user-authorized integrations. Its MIT
+license does not authorize shared plan access, token resale, paid access to
+SIWC, or a hosted service. See docs/DISTRIBUTION.md for integration conditions
+and https://openai.com/policies/sign-in-with-chatgpt-terms/ for the current terms.
+
+The official Sign in with ChatGPT DevKit was reviewed but is not included,
+modified, or redistributed. Its publicly exported text-only response API
+does not provide the native tool-call and history interfaces needed here.
+Its Noncommercial License v1.0 is not replaced or sublicensed by this project.
+
+Third-party dependencies retain their own licenses:
+- jose 6.2.12: MIT
+- TypeScript 5.9.3 (development only): Apache-2.0
+- @types/node 24.19.1 (development only): MIT
+
+The DeepSeek Harness integration is separate from the SDK core. Dependencies
+of that integration retain their own licenses and notices. The core source
+license does not sublicense DeepSeek Harness or other third-party software.
+
+Do not include personal credentials, application registrations, local PC state,
+private logs, or vendor brand assets when distributing this repository.

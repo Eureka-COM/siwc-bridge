@@ -1,0 +1,53 @@
+name: 不具合の報告 / Bug report
+description: 動作の不具合を報告します。トークンやログの生データは貼らないでください。
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **トークン、Cookie、`credentials.dpapi`、メールアドレス、ログの生データは絶対に貼らないでください。** 公開されます。
+        エラー表示に出る `provider_code`、`http`、`request_id` は貼っても問題ありません。
+        **Never paste tokens, cookies, credential files, e-mail addresses or raw logs. This issue is public.**
+  - type: dropdown
+    id: part
+    attributes:
+      label: 対象 / Component
+      options:
+        - 汎用SDK（src/）
+        - DSH接続（integrations/dsh/）
+        - 文書 / Docs
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版 / Version
+      description: タグ（例 v0.2.0）またはコミット
+      placeholder: v0.2.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 環境 / Environment
+      placeholder: Windows 11, Node.js 24.13.0
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順 / Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 期待した結果と実際の結果 / Expected vs actual
+      description: エラー表示の provider_code・http・request_id があれば書いてください。
+    validations:
+      required: true
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: 確認 / Confirmation
+      options:
+        - label: トークン・Cookie・資格情報ファイル・個人情報を含めていません / I removed all tokens, credentials and personal data
+          required: true

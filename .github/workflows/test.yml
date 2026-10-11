@@ -1,0 +1,46 @@
+name: Windows checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        directory: ['.', 'integrations/dsh']
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.13.0'
+      - run: npm.cmd ci --ignore-scripts --no-audit --no-fund
+      - run: npm.cmd audit --audit-level=moderate --ignore-scripts
+      - run: npm.cmd run build
+      - run: npm.cmd run typecheck
+      - run: npm.cmd test
+      - if: matrix.directory == '.'
+        run: npm.cmd run example:mock
+      - run: npm.cmd run check:publication
+  secrets:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Scan all Git history with verified Gitleaks 8.30.1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'gitleaks.zip'
+          Invoke-WebRequest -Uri 'https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_windows_x64.zip' -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e') { throw 'Gitleaks archive hash mismatch' }
+          $tools = Join-Path $env:RUNNER_TEMP 'gitleaks'
+          Expand-Archive -LiteralPath $archive -DestinationPath $tools
+          & (Join-Path $tools 'gitleaks.exe') git . --redact=100 --log-opts='--all --full-history' --no-banner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

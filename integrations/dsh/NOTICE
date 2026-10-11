@@ -1,0 +1,14 @@
+dsh-siwc-bridge independently authored code: MIT (see LICENSE).
+This license does not grant access to OpenAI services or rights to third-party code or branding.
+
+Runtime dependency jose 6.2.12: MIT; https://github.com/panva/jose
+Host peer dependencies @deepseek-ai/cordis 4.0.5-alpha.1 and dsh packages
+0.2.1-alpha.1: MIT; https://github.com/deepseek-ai/deepseek-harness
+Build-only TypeScript 5.9.3: Apache-2.0; https://github.com/microsoft/TypeScript
+Build-only @types/node 24.19.1: MIT; https://github.com/DefinitelyTyped/DefinitelyTyped
+
+Dependencies are obtained separately with npm; their original licenses remain applicable.
+The local source archive and plugin archive do not embed dependency code, native libraries,
+the OpenAI SIWC DevKit, its source, or branding assets. The dsh validation host pulls its
+own transitive dependencies with the fixed package-lock; those retain their own licenses.
+OpenAI SIWC Terms apply separately to service use. This is not an official or endorsed product.
