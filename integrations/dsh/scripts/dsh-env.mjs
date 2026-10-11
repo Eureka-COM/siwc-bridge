@@ -115,7 +115,10 @@ export async function initializeProfile(name, template, { home = paths.home } = 
 // Everything else stays DSH's default.
 /** The web search provider id this plugin registers (src/web-search.ts SEARCH_PROVIDER_ID). */
 const SEARCH_PROVIDER = 'siwc';
-const disabledRows = ['session-title-llm', 'session-telemetry-otel', 'authorization', 'credentials', 'llm-deepseek', 'llm-deepseek-account', 'llm-pi-ai', 'deepseek-account'];
+// The DeepSeek account page and the DeepSeek search provider (with its key form) have nothing
+// to act on here: the account service is off, and web_search goes through the ChatGPT plan.
+const disabledRows = ['session-title-llm', 'session-telemetry-otel', 'authorization', 'credentials', 'llm-deepseek', 'llm-deepseek-account', 'llm-pi-ai', 'deepseek-account',
+  'account-controller', 'ui-settings-account', 'web-search-deepseek', 'ui-settings-web-search'];
 const yaml = value => JSON.stringify(value);
 
 /**
