@@ -5,15 +5,46 @@
   "type": "module",
   "license": "MIT",
   "main": "lib/index.js",
-  "exports": { ".": "./lib/index.js", "./web-credentials": "./lib/web-credentials.js" },
-  "bin": { "dsh-siwc": "lib/cli.js" },
-  "files": ["lib/", "scripts/dpapi.ps1", "cordis.patch.yml", "README.md", "docs/", "LICENSE", "NOTICE"],
-  "engines": { "node": ">=24.0.0" },
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "exports": {
+    ".": "./lib/index.js",
+    "./web-credentials": "./lib/web-credentials.js",
+    "./client": {
+      "default": "./lib/client.js"
+    }
+  },
+  "bin": {
+    "dsh-siwc": "lib/cli.js"
+  },
+  "files": [
+    "lib/",
+    "scripts/dpapi.ps1",
+    "cordis.patch.yml",
+    "README.md",
+    "docs/",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-commands",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-api-remotes"
+      ]
+    }
+  },
   "scripts": {
     "sync-core": "node scripts/sync-core.mjs",
-    "build": "node scripts/sync-core.mjs && tsc -p tsconfig.json",
-    "typecheck": "node scripts/sync-core.mjs && tsc -p tsconfig.json --noEmit",
+    "build": "node scripts/sync-core.mjs && tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
+    "typecheck": "node scripts/sync-core.mjs && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json",
     "test": "node scripts/sync-core.mjs && node --test --test-concurrency=1 tests/*.test.ts",
     "setup": "node scripts/setup.mjs",
     "start": "node scripts/start.mjs",
@@ -22,17 +53,36 @@
     "release:local": "node scripts/release.mjs",
     "check:publication": "node scripts/release.mjs --check-only"
   },
-  "dependencies": { "jose": "6.2.12" },
-  "overrides": { "@modelcontextprotocol/client": "2.2.0", "fflate": "0.8.3" },
-  "peerDependencies": { "@deepseek-ai/cordis": "4.0.5-alpha.1", "@deepseek-ai/dsh-llm": "0.2.1-alpha.1", "@deepseek-ai/dsh-agent": "0.2.1-alpha.1", "@deepseek-ai/dsh-commands": "0.2.1-alpha.1", "@deepseek-ai/dsh-credentials": "0.2.1-alpha.1" },
-  "devDependencies": {
+  "dependencies": {
+    "jose": "6.2.12"
+  },
+  "overrides": {
+    "@modelcontextprotocol/client": "2.2.0",
+    "fflate": "0.8.3"
+  },
+  "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.5-alpha.1",
-    "@deepseek-ai/dsh-llm": "0.2.1-alpha.1",
-    "@deepseek-ai/dsh": "0.2.1-alpha.1",
     "@deepseek-ai/dsh-agent": "0.2.1-alpha.1",
     "@deepseek-ai/dsh-commands": "0.2.1-alpha.1",
     "@deepseek-ai/dsh-credentials": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-llm": "0.2.1-alpha.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@deepseek-ai/dsh": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-agent": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-api-remotes": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-commands": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-commands": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-credentials": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-llm": "0.2.1-alpha.1",
     "@types/node": "24.19.1",
+    "@types/react": "18.3.1",
+    "esbuild": "0.28.2",
+    "react": "18.3.1",
     "typescript": "5.9.3"
   }
 }
