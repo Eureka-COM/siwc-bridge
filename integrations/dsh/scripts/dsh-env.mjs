@@ -159,16 +159,36 @@ export async function writeRuntimePatch(file, { provider = 'siwc', model, guard,
 /** v0.2 name, used by tests: the read-only dummy workspace is kept there explicitly. */
 export const writeIsolationPatch = (file, options = {}) => writeRuntimePatch(file, { workspace: paths.workspace, readOnly: true, ...options });
 
-/** Default model for a new start: the saved choice, else the first model of the saved account catalog, else none (choose in DSH). */
+/**
+ * Default model for a new start: the saved choice, else the first model of the
+ * account catalog (saved, or fetched once). Retried, because a start right after
+ * sign-in or another process's refresh can briefly find the store busy. The
+ * reason is returned so the launcher can say why no default was set.
+ */
 export async function readSelectedModel(explicitModel) {
   if (explicitModel) return { model: explicitModel };
-  try {
-    const [{ selectedModel }, { AuthManager }, { diskCatalogStore }] = await Promise.all([import('../lib/admin.js'), import('../lib/auth.js'), import('../lib/local-cache.js')]);
-    const auth = new AuthManager();
-    const saved = await selectedModel(auth);
-    if (saved) return { model: saved };
-    const active = (await auth.status()).activeId;
-    const catalog = active ? await diskCatalogStore().load(active) : undefined;
-    return { model: catalog?.[0]?.id };
-  } catch { return { model: undefined }; }
+  let reason;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const [{ selectedModel }, { AuthManager }, { diskCatalogStore }, { createServices }] = await Promise.all([
+        import('../lib/admin.js'), import('../lib/auth.js'), import('../lib/local-cache.js'), import('../lib/admin.js')]);
+      const auth = new AuthManager();
+      try {
+        const saved = await selectedModel(auth);
+        if (saved) return { model: saved };
+        const status = await auth.status();
+        if (!status.activeId) return { model: undefined, reason: 'not signed in yet' };
+        const stored = await diskCatalogStore().load(status.activeId);
+        if (stored?.length) return { model: stored[0].id };
+        const { adapter } = createServices();
+        const fresh = await adapter.listModelsFresh('siwc');
+        if (fresh.length) return { model: fresh[0].id };
+        return { model: undefined, reason: 'no model is listed for this account' };
+      } finally { auth.abortAll(); }
+    } catch (error) {
+      reason = `could not read the sign-in state: ${error?.code ?? error?.name ?? 'error'}`;
+      if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+    }
+  }
+  return { model: undefined, reason };
 }
