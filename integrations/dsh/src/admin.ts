@@ -47,6 +47,14 @@ export async function selectedModel(auth: AuthManager): Promise<string | undefin
   } catch { return undefined; }
 }
 
+/** The saved default model, else the first model of the account catalog. */
+export async function defaultModel(auth: AuthManager, adapter: SiwcAdapter, signal?: AbortSignal): Promise<string | undefined> {
+  const saved = await selectedModel(auth);
+  if (saved) return saved;
+  const models = await adapter.listModels('siwc', signal).catch(() => []);
+  return models[0]?.id;
+}
+
 export function formatStatus(status: AuthStatus, model: string | undefined, paused: boolean, diagnostics: string): string {
   const rows = status.registrations.map(r => `${r.active ? '*' : ' '} ${r.id} ${r.label}: ${r.authenticated ? 'サインイン済み' : 'サインインが必要（/siwc login ' + r.id + '）'}${r.authenticated && !r.planAllowed ? ' / プラン利用が未許可' : ''}`);
   return ['ChatGPT plan (SIWC) — Using ChatGPT plan', ...(rows.length ? rows : ['未サインイン: /siwc login で始めてください。']),

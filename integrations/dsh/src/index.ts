@@ -3,16 +3,20 @@ import type {} from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-commands';
 import { resolveImageAttachmentAccess } from '@deepseek-ai/dsh-llm';
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
-import { createServices, signIn, saveModel, statusText, MANAGE_USAGE, PRIVACY_NOTICE } from './admin.js';
+import { createServices, defaultModel, signIn, saveModel, statusText, MANAGE_USAGE, PRIVACY_NOTICE } from './admin.js';
 import type { ImageSource } from './adapter.js';
 import { safeFailure } from './errors.js';
+import { SiwcSearchProvider, type WebSearchProvider } from './web-search.js';
 
 export const name = 'dsh-siwc-bridge';
 export const inject = ['llm'];
 
 const HELP = '/siwc [status] | login [登録ID] | models | model <slug> | select <登録ID> | sign-out | manage | resume | diagnostics';
 
-/** One provider ("ChatGPT plan (SIWC)") and one slash command. Everything else is DSH's own behaviour. */
+/**
+ * One model provider ("ChatGPT plan (SIWC)"), one web search provider for DSH's own
+ * `web_search` tool, and one slash command. Everything else is DSH's own behaviour.
+ */
 export function apply(ctx: Context): void {
   const service = <T>(name: string) => (ctx as unknown as { get(name: string): T | undefined }).get(name);
   const { auth, adapter, diagnostics } = createServices({
@@ -25,6 +29,17 @@ export function apply(ctx: Context): void {
   // A background catalog refresh that changed the list re-notifies the selector.
   adapter.onCatalogUpdated = () => registration?.replace?.(['siwc']);
   ctx.effect(() => () => { adapter.cancelRequests(); auth.abortAll(); });
+  // DSH's web_search tool asks ctx.web; the launcher selects this provider ("siwc").
+  // A search uses the model of the conversation that asked when it is a ChatGPT-plan model.
+  const currentModel = async () => {
+    type Initiator = { session?: { requestContext?(): { provider?: string; model?: string } | undefined } };
+    const context = service<{ currentInitiator?(): Initiator | undefined }>('agents')?.currentInitiator?.()?.session?.requestContext?.();
+    if (context?.provider === 'siwc' && context.model) return context.model;
+    return defaultModel(auth, adapter);
+  };
+  ctx.inject(['web'], webCtx => {
+    (webCtx as unknown as { web: { registerSearchProvider(provider: WebSearchProvider): () => void } }).web.registerSearchProvider(new SiwcSearchProvider(adapter, currentModel));
+  });
   ctx.inject(['commands'], commandCtx => {
     commandCtx.commands.register({
       name: 'siwc', description: 'ChatGPTプラン（Sign in with ChatGPT）の状態・サインイン・モデル一覧・利用状況', recordInput: false,

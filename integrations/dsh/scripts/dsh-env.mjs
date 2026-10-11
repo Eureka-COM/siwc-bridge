@@ -113,6 +113,8 @@ export async function initializeProfile(name, template, { home = paths.home } = 
 // DeepSeek-account features need a DeepSeek sign-in this home never has; telemetry is
 // off, and titles come from the first prompt instead of an extra model request.
 // Everything else stays DSH's default.
+/** The web search provider id this plugin registers (src/web-search.ts SEARCH_PROVIDER_ID). */
+const SEARCH_PROVIDER = 'siwc';
 const disabledRows = ['session-title-llm', 'session-telemetry-otel', 'authorization', 'credentials', 'llm-deepseek', 'llm-deepseek-account', 'llm-pi-ai', 'deepseek-account'];
 const yaml = value => JSON.stringify(value);
 
@@ -136,6 +138,8 @@ export async function writeRuntimePatch(file, { provider = 'siwc', model, guard,
   if (workspace && readOnly) content += `\n- id: sandbox-policy\n  config:\n    mode: read-only\n    workspaceRoot: ${yaml(workspace)}\n`;
   if (workspace) content += '\n- id: fs-sandbox\n  config:\n    cwd: ' + yaml(workspace) + '\n';
   content += '\n- id: tools\n  config:\n    mode: native\n';
+  // DSH's web_search tool otherwise needs a DeepSeek API key or account; search through the ChatGPT plan instead.
+  if (!fixture) content += `\n- id: web\n  config:\n    searchProvider: ${yaml(SEARCH_PROVIDER)}\n    fetchProvider: http\n`;
   if (model) content += `\n- id: agent-default-model\n  config:\n    provider: ${yaml(provider)}\n    model: ${yaml(model)}\n${effort ? `    reasoningEffort: ${yaml(effort)}\n` : ''}`;
   const inserted = [];
   if (guard) inserted.push({ id: 'siwc-test-guard', name: guard.path ?? paths.guardFixture, config: {

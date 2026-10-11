@@ -48,6 +48,11 @@ export function reasoningRequest(model: string, effort: unknown): { effort?: str
   return typeof effort === 'string' && efforts.some(candidate => candidate === effort) ? { effort, summary: 'auto' } : { summary: 'auto' };
 }
 
+/** Searches run at the lowest documented effort ("low"); an unlisted model uses its provider default. */
+export function searchEffort(model: string): 'low' | undefined {
+  return MODEL_EFFORTS.get(model)?.includes('low') ? 'low' : undefined;
+}
+
 /**
  * Documented capacity of the exact model IDs above (same official pages, 2026-10-11):
  * 1,050,000-token context window, 128,000 max output, text and image input.

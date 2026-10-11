@@ -6,16 +6,26 @@ import { join } from 'node:path';
 import { apply } from '../lib/index.js';
 
 function load() {
-  const events = new Map<string, Function>(); let handler: Function | undefined; const registered: string[][] = [];
+  const events = new Map<string, Function>(); let handler: Function | undefined; const registered: string[][] = []; const searchProviders: any[] = [];
   const context = {
     llm: { registerAdapter(providers: string[]) { registered.push(providers); return { replace() {} }; } },
     effect() {}, get() { return undefined; },
     on(name: string, callback: Function) { events.set(name, callback); },
-    inject(_names: string[], callback: Function) { callback({ commands: { register(command: { handler: Function }) { handler = command.handler; } } }); },
+    inject(names: string[], callback: Function) {
+      if (names.includes('web')) callback({ web: { registerSearchProvider(provider: unknown) { searchProviders.push(provider); return () => undefined; } } });
+      else callback({ commands: { register(command: { handler: Function }) { handler = command.handler; } } });
+    },
   };
   apply(context as never);
-  return { events, registered, invoke: (rawInput: string) => handler!({ rawInput, signal: new AbortController().signal }) };
+  return { events, registered, searchProviders, invoke: (rawInput: string) => handler!({ rawInput, signal: new AbortController().signal }) };
 }
+
+test('DSH’s own web_search tool gets a ChatGPT-plan search provider instead of needing a DeepSeek key', () => {
+  const { searchProviders } = load();
+  assert.equal(searchProviders.length, 1);
+  assert.equal(searchProviders[0].id, 'siwc');
+  assert.equal(searchProviders[0].available(), true);
+});
 
 test('the plugin registers one provider and one command, and no longer refuses attachments or history at the Agent boundary', () => {
   const { events, registered } = load();

@@ -4,10 +4,11 @@ import { LlmAdapter, LlmError, IMAGE_OFFLOAD_REQUIRED_CODE, attributionHeaders, 
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import { BridgeError, rememberFailure } from './errors.js';
 import { readText } from './http.js';
-import { contextForModel, reasoningForModel } from './reasoning.js';
+import { contextForModel, reasoningForModel, searchEffort } from './reasoning.js';
 import type { CatalogStore } from './local-cache.js';
 import { noDiagnostics, type Diagnostics } from './diagnostics.js';
 import { buildRequest, label, Notes, object, ProviderFailure, providerFailure, readSse, ResponseStream, type RequestImage, type RequestMedia } from './protocol.js';
+import { checkedQuery, SEARCH_TIMEOUT_MS, SearchCollector, searchRequest, type WebSearchRequest, type WebSearchResult } from './web-search.js';
 
 export interface CredentialSource {
   withAccessToken<T>(operation: (token: string, currentSignal?: AbortSignal, registrationId?: string) => Promise<T>, signal?: AbortSignal): Promise<T>;
@@ -244,6 +245,50 @@ export class SiwcAdapter extends LlmAdapter {
     const offloadImages = requiredImageOffload(messages, { representation: 'base64', maxBytes: IMAGE_POLICY.maxRequestBase64 }, block => images.get(block.attachment.attachmentId)?.bytes ?? 0);
     if (offloadImages > 0) throw new LlmError(`添付画像の合計が大きいため、古い画像${offloadImages}枚を文字の参照に置き換えて再実行します。`, IMAGE_OFFLOAD_REQUIRED_CODE, { offloadImages });
     return { options: { ...options, messages: [...messages] }, media: { images, handle: (ref, version) => requestImageHandleText(ref, version, access(ref)) } };
+  }
+
+  /**
+   * One web search through the ChatGPT plan (hosted `web_search` on the SIWC route).
+   * Same pause, sign-out cancellation, failure mapping and diagnostics as a turn.
+   */
+  async webSearch(request: WebSearchRequest & { model: string }, callerSignal?: AbortSignal): Promise<WebSearchResult> {
+    const notes = new Notes(); const started = Date.now();
+    const controller = new AbortController(); this.requests.add(controller);
+    let signal = AbortSignal.any([controller.signal, AbortSignal.timeout(SEARCH_TIMEOUT_MS), ...(callerSignal ? [callerSignal] : [])]);
+    let scope: { signal: AbortSignal; close(): void } | undefined;
+    let response: Response | undefined;
+    let outcome = 'ok';
+    let failure: LlmError | undefined;
+    try {
+      const query = checkedQuery(request.query);
+      if (this.paused) throw new BridgeError('USAGE_PAUSED', `ChatGPTプランの利用上限のため、新しい要求を止めています。${MANAGE_USAGE} で確認してから /siwc resume を実行してください。`);
+      scope = await this.credentials.openRequestScope?.(signal);
+      if (scope) signal = AbortSignal.any([signal, scope.signal]);
+      response = await this.request('inference', signal, () => searchRequest(query, request.model, searchEffort(request.model)));
+      const collector = new SearchCollector(notes);
+      for await (const event of readSse(response.body ?? new ReadableStream(), signal, notes)) {
+        collector.accept(event);
+        if (collector.completed) break;
+      }
+      if (!collector.completed) throw new BridgeError('STREAM_INTERRUPTED', 'Web検索の応答が完了する前に途切れました。');
+      return collector.result(request.maxResults);
+    } catch (error) {
+      // Web search is allowed per model and account/workspace policy; say so instead of a generic refusal.
+      const refused = error instanceof ProviderFailure && (error.code === 'subscription_sharing_unsupported_capability' || (error.status === 400 && /^tool/.test(error.param ?? '')));
+      failure = classify(refused ? new BridgeError('SEARCH_UNAVAILABLE', `このモデルまたはアカウント（workspace）の設定では、ChatGPTプラン経由のWeb検索を使えません。別のモデルを選ぶか、ChatGPTの設定を確認してください。`, error.status, error.requestId) : error, signal);
+      outcome = failure.code;
+      if (failure instanceof SiwcLlmError && failure.providerCode === USAGE_LIMIT) this.paused = true;
+      throw failure;
+    } finally {
+      controller.abort(); scope?.close(); this.requests.delete(controller);
+      await response?.body?.cancel().catch(() => undefined);
+      const native = failure instanceof SiwcLlmError ? failure : undefined;
+      this.diagnostics.record({
+        kind: 'search', model: label(request.model, 80), outcome, provider_code: native && native.providerCode !== outcome ? label(native.providerCode) : undefined,
+        http: response?.status ?? native?.failure?.status, request_id: label(response?.headers.get('x-request-id') ?? native?.failure?.requestId, 160),
+        ms: Date.now() - started, notes: notes.size ? notes.list().join(',') : undefined,
+      });
+    }
   }
 
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {

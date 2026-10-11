@@ -1,6 +1,6 @@
 // Real-account end-to-end checks through a headless DSH profile with the installed plugin.
 // Uses the signed-in ChatGPT plan: every scenario sends real requests. Run only when intended:
-//   node scripts/e2e.mjs [scenario ...]        (default: all)
+//   node scripts/e2e.mjs [scenario ...]        (default: all: text tool continue switch search effort multitool subagent long)
 // Writes full run events to .work/e2e/<time>/ (test prompts only) and prints a summary.
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -81,6 +81,11 @@ if (want('continue') && toolSession) {
 if (want('switch') && toolSession && otherModel) {
   const r = await turn('switch', 'この会話で読んだファイルの value の値をもう一度だけ返してください。', { model: otherModel, sessionId: toolSession });
   check(r, r.exitCode === 0 && r.final.includes(marker), `model=${otherModel}`);
+}
+if (want('search')) {
+  // DSH's own web_search tool, answered through the ChatGPT plan (no DeepSeek key).
+  const r = await turn('search', 'web_search ツールで Node.js 24 LTS のコードネームを調べ、コードネームと、根拠にしたページのURLを1つだけ答えてください。', { model });
+  check(r, r.exitCode === 0 && r.tools.includes('web_search') && r.toolErrors === 0 && /krypton/i.test(r.final) && /https?:\/\//.test(r.final));
 }
 if (want('effort')) { const r = await turn('effort', '1から100までの素数はいくつありますか。数字だけで答えてください。', { model, effort: 'max' }); check(r, r.exitCode === 0 && /25/.test(r.final)); }
 if (want('multitool')) {
