@@ -5,14 +5,27 @@ import { buildRequest, object, ProviderFailure, providerFailure, readSse, Respon
 import type { ClientEvent, CompletedResponse, ModelInfo, ResponseRequest, ResponseOutputItem } from './types.js';
 
 export interface CredentialSource {
-  withAccessToken<T>(operation: (token: string, signal?: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T>;
+  /**
+   * `registrationId` must identify the registration the token belongs to, read
+   * from the same snapshot as the token. When `status` is provided, a request
+   * that reuses history is refused unless this matches the history's registration.
+   */
+  withAccessToken<T>(operation: (token: string, signal?: AbortSignal, registrationId?: string) => Promise<T>, signal?: AbortSignal): Promise<T>;
   openRequestScope?: (signal?: AbortSignal) => Promise<{ signal: AbortSignal; check?(): Promise<void>; close(): void }>;
   status?: (signal?: AbortSignal) => Promise<{ activeId?: string }>;
 }
+/** The host's shared stop state. `generation` increases on every explicit human (re)start. */
+export interface UsageState { stopped: boolean; generation: number }
 export interface RequestObserver {
   beforeRequest: (kind: 'models' | 'inference', signal: AbortSignal) => Promise<void>;
   /** Persist the stop in the host's shared policy; only a new human start may clear it. */
   onUsageLimit?: () => Promise<void>;
+  /**
+   * Read the shared stop state. With it, a usage-limit stop in this process ends
+   * when any process records a newer human start; without it, only
+   * `resetUsageLimit()` in this process ends it.
+   */
+  usageState?: (signal?: AbortSignal) => Promise<UsageState>;
 }
 export interface ReplayOptions { maxReplayItems?: number }
 const usageLimit = (error: BridgeError) => ['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable'].includes(error.code);
@@ -35,7 +48,8 @@ export class SiwcClient {
   private readonly maxReplayItems: number;
   private replayIdentity?: string;
   private replayEpoch = 0;
-  private limited = false;
+  /** Shared start generation seen when this process stopped; Infinity if it could not be read. */
+  private limitedAt?: number;
   constructor(private readonly credentials: CredentialSource, private readonly observer: RequestObserver, options: ReplayOptions = {}) {
     this.maxReplayItems = options.maxReplayItems ?? 4096;
     if (!Number.isSafeInteger(this.maxReplayItems) || this.maxReplayItems < 1 || this.maxReplayItems > 65536) {
@@ -45,25 +59,40 @@ export class SiwcClient {
   cancelRequests(): void { for (const request of this.requests) request.abort(); }
   /** End conversations and invalidate in-flight provenance before releasing the host's history. */
   clearReplayHistory(): void { this.cancelRequests(); this.replays.clear(); this.replayEpoch++; }
-  isUsageLimited(): boolean { return this.limited; }
-  resetUsageLimit(): void { this.limited = false; }
+  isUsageLimited(): boolean { return this.limitedAt !== undefined; }
+  resetUsageLimit(): void { this.limitedAt = undefined; }
   private async stopForUsage(error: unknown): Promise<void> {
     if (error instanceof BridgeError && usageLimit(error)) {
-      this.limited = true;
+      this.limitedAt = Number.POSITIVE_INFINITY;
       await this.observer.onUsageLimit?.();
+      // Only a start recorded after this point may lift the stop in this process.
+      const state = await this.observer.usageState?.().catch(() => undefined);
+      if (state && Number.isSafeInteger(state.generation)) this.limitedAt = state.generation;
     }
+  }
+  /** A local stop that never re-records itself: it is not a provider usage error. */
+  private async checkUsageStop(signal: AbortSignal): Promise<void> {
+    if (this.limitedAt === undefined) return;
+    const state = await this.observer.usageState?.(signal).catch(() => undefined);
+    if (state && !state.stopped && Number.isSafeInteger(state.generation) && state.generation > this.limitedAt) { this.limitedAt = undefined; return; }
+    throw new BridgeError('USAGE_LIMIT_STOPPED', '利用上限で推論を停止しています。公式Usageを確認し、本人の操作で再開してください。');
   }
   private async identity(signal: AbortSignal): Promise<string> {
     return this.credentials.status ? (await this.credentials.status(signal)).activeId ?? 'not-signed-in' : this.instanceIdentity;
   }
-  private async request(kind: 'models' | 'inference', signal: AbortSignal, body?: Record<string, unknown>): Promise<Response> {
+  private async request(kind: 'models' | 'inference', signal: AbortSignal, body?: Record<string, unknown>, expected?: { identity: string; history: boolean }): Promise<Response> {
     signal.throwIfAborted();
-    return this.credentials.withAccessToken(async (token, currentSignal) => {
+    return this.credentials.withAccessToken(async (token, currentSignal, registrationId) => {
       const combined = currentSignal ? AbortSignal.any([signal, currentSignal]) : signal;
       combined.throwIfAborted();
-      if (kind === 'inference' && this.limited) throw new BridgeError('subscription_sharing_usage_limit_exceeded', '公式Usageを本人が確認するまで推論を停止します。');
+      // The token's own registration, from the same snapshot as the token, must be
+      // the one the history was validated for. Checked before anything is sent.
+      if (expected && this.credentials.status && registrationId !== expected.identity && (registrationId !== undefined || expected.history)) {
+        throw new BridgeError('INVALID_REPLAY_CONTEXT', '送信時の登録が会話履歴の登録と一致しません。新しい会話を開始してください。');
+      }
+      if (kind === 'inference') await this.checkUsageStop(combined);
       const headers = new Headers({ authorization: `Bearer ${token}`, accept: kind === 'models' ? 'application/json' : 'text/event-stream',
-        'user-agent': 'siwc-bridge/0.2.1 (https://github.com/Eureka-COM/siwc-bridge)' });
+        'user-agent': 'siwc-bridge/0.2.2 (https://github.com/Eureka-COM/siwc-bridge)' });
       if (body) headers.set('content-type', 'application/json');
       await this.observer.beforeRequest(kind, combined);
       combined.throwIfAborted();
@@ -136,11 +165,11 @@ export class SiwcClient {
       const identity = await this.identity(signal);
       if (this.replayIdentity !== identity) { this.replays.clear(); this.replayEpoch++; this.replayIdentity = identity; }
       const epoch = this.replayEpoch, retained = this.validateReplay({ model, input }, identity);
-      if (this.limited) throw new BridgeError('subscription_sharing_usage_limit_exceeded', '公式Usageを本人が確認するまで推論を停止します。');
+      await this.checkUsageStop(signal);
       // No catalog GET before inference: SIWC documents the catalog as selector data,
       // not an entitlement check; a completed turn is what verifies model access.
       await scope?.check?.();
-      response = await this.request('inference', signal, body);
+      response = await this.request('inference', signal, body, { identity, history: retained.size > 0 });
       const contentType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
       if (!response.body || (contentType && contentType !== 'text/event-stream')) throw new BridgeError('INVALID_STREAM', 'SIWCのstream応答を確認できません。');
       const allowed = new Set(options.tools?.flatMap(namespace => namespace.tools.map(tool => `${namespace.name}/${tool.name}`)) ?? []);

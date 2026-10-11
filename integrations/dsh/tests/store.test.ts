@@ -7,7 +7,7 @@ import { spawn, execFile } from 'node:child_process';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { promisify } from 'node:util';
-import { createMemoryTestStore, createWindowsTestStore } from '../lib/store.js';
+import { createMemoryTestStore, createWindowsTestStore, systemPowerShell } from '../lib/store.js';
 
 test('memory test store has stable host identity and separate serialized registrations', async () => {
   const store = createMemoryTestStore();
@@ -86,7 +86,7 @@ test('Windows CurrentUser DPAPI, atomic persistence, restart, and OS exclusive l
   const waitStart = Date.now();
   await first.transaction(async () => { assert.ok(Date.now() - waitStart >= 500, 'The other process must release its OS lock before entering'); });
   await completed;
-  const acl = await promisify(execFile)('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '$a=[IO.Directory]::GetAccessControl($env:DSH_FAKE_STORE); $s=[Security.Principal.WindowsIdentity]::GetCurrent().User; $valid=$a.AreAccessRulesProtected -and ($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $s.Value); foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) { if($r.IdentityReference.Value -ne $s.Value) { $valid=$false } }; [Console]::Out.WriteLine($valid)'], { windowsHide: true, env: { ...process.env, DSH_FAKE_STORE: directory } });
+  const acl = await promisify(execFile)(systemPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', '$a=[IO.Directory]::GetAccessControl($env:DSH_FAKE_STORE); $s=[Security.Principal.WindowsIdentity]::GetCurrent().User; $valid=$a.AreAccessRulesProtected -and ($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $s.Value); foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) { if($r.IdentityReference.Value -ne $s.Value) { $valid=$false } }; [Console]::Out.WriteLine($valid)'], { windowsHide: true, env: { ...process.env, DSH_FAKE_STORE: directory } });
   assert.equal(acl.stdout.trim(), 'True');
   const request = await first.openRequestScope();
   try {

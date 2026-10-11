@@ -74,11 +74,11 @@ test('opaque output replays only in the same client, model and selected registra
       if (url === 'https://api.openai.com/v1/models') return Response.json({ models: ['fixture', 'other'].map(slug => ({ slug, display_name: slug, visibility: 'list' })) });
       assert.equal(url, 'https://api.openai.com/v1/responses'); inference++;
       const body = JSON.parse(String(init?.body));
-      if (inference > 1) assert.ok(body.input.some((item: any) => item.encrypted_content === reasoning.encrypted_content));
+      if (inference > 1 && body.input.length > 1) assert.ok(body.input.some((item: any) => item.encrypted_content === reasoning.encrypted_content));
       return completed([reasoning, { type: 'message', role: 'assistant', id: 'msg_fixture', status: 'completed',
         content: [{ type: 'output_text', text: 'fixture answer', annotations: [] }] }]);
     };
-    const credentials = { status: async () => ({ activeId: identity }), withAccessToken: <T>(operation: (token: string) => Promise<T>) => operation('synthetic-test-only') };
+    const credentials = { status: async () => ({ activeId: identity }), withAccessToken: <T>(operation: (token: string, signal?: AbortSignal, registrationId?: string) => Promise<T>) => operation('synthetic-test-only', undefined, identity) };
     const observer = { beforeRequest: async () => {} };
     const client = new SiwcClient(credentials, observer);
     const response = await client.complete({ model: 'fixture', input: [{ role: 'user', content: 'test' }] });
@@ -91,6 +91,12 @@ test('opaque output replays only in the same client, model and selected registra
     await assert.rejects(client.complete({ model: 'fixture', input }), { code: 'INVALID_REPLAY_CONTEXT' });
     await assert.rejects(new SiwcClient(credentials, observer).complete({ model: 'fixture', input }), { code: 'INVALID_REPLAY_CONTEXT' });
     assert.equal(inference, 2);
+    // A source that cannot name the token's registration may not reuse history.
+    const unbound = new SiwcClient({ status: credentials.status, withAccessToken: <T>(operation: (token: string) => Promise<T>) => operation('synthetic-test-only') }, observer);
+    const fresh = JSON.parse(JSON.stringify((await unbound.complete({ model: 'fixture', input: [{ role: 'user', content: 'test' }] })).output));
+    assert.equal(inference, 3);
+    await assert.rejects(unbound.complete({ model: 'fixture', input: fresh }), { code: 'INVALID_REPLAY_CONTEXT' });
+    assert.equal(inference, 3);
   } finally { globalThis.fetch = old; }
 });
 test('subscription unavailable/limit after HTTP latches without a new request', async () => {

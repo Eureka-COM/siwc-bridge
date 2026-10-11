@@ -6,7 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { BridgeError } from './errors.js';
 import { readText } from './http.js';
 import { validateAppIdentity, type AppIdentity } from './app.js';
-import { WindowsStore, createMemoryTestStore, createWindowsTestStore, type AuthStore, type CredentialState, type Registration, type Credentials, type RequestScope } from './store.js';
+import { WindowsStore, systemPowerShell, createMemoryTestStore, createWindowsTestStore, type AuthStore, type CredentialState, type Registration, type Credentials, type RequestScope } from './store.js';
 
 const AUTH_ORIGIN = 'https://auth.openai.com';
 const DISCOVERY = `${AUTH_ORIGIN}/.well-known/openid-configuration`;
@@ -89,11 +89,13 @@ function authorizationURL(tx: Transaction, state: CredentialState, registration:
   if (forceConsent) url.searchParams.set('prompt', 'consent');
   return url.href;
 }
-async function systemBrowser(url: string): Promise<void> {
+export async function systemBrowser(url: string): Promise<void> {
   if (process.platform !== 'win32') throw new BridgeError('windows_required', 'Windowsのシステムブラウザが必要です。');
+  let powershell: string;
+  try { powershell = systemPowerShell(); } catch { throw new BridgeError('browser_unavailable', 'システムブラウザを開けませんでした。'); }
   // URL passes through stdin, never shell interpolation, process arguments, or logs.
   await new Promise<void>((accept, reject) => {
-    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop"; try { $u=[Console]::In.ReadToEnd(); Start-Process -FilePath $u -WindowStyle Hidden | Out-Null; exit 0 } catch { exit 1 }'], { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
+    const child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop"; try { $u=[Console]::In.ReadToEnd(); Start-Process -FilePath $u -WindowStyle Hidden | Out-Null; exit 0 } catch { exit 1 }'], { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
     const timer = setTimeout(() => { child.kill(); reject(new BridgeError('browser_unavailable', 'システムブラウザを開けませんでした。')); }, 10_000);
     child.once('error', () => { clearTimeout(timer); reject(new BridgeError('browser_unavailable', 'システムブラウザを開けませんでした。')); });
     child.once('exit', code => { clearTimeout(timer); if (code === 0) accept(); else reject(new BridgeError('browser_unavailable', 'システムブラウザを開けませんでした。')); });
@@ -130,7 +132,7 @@ async function browserCallback(tx: Transaction, urlFactory: () => string, openBr
         return;
       }
       try { const result = consumeCallback(tx, url, now()); response.writeHead(200).end(page('Sign-in response received. You may close this window.')); accept(result); }
-      catch (error) { response.writeHead(400).end(page('Sign-in could not be verified. Restart sign-in from siwc-bridge.')); reject(error); }
+      catch (error) { response.writeHead(400).end(page('Sign-in could not be verified. Restart sign-in from the application.')); reject(error); }
     });
   });
   // Prevent an unhandled rejection if cancellation arrives while the browser opens.
@@ -139,7 +141,8 @@ async function browserCallback(tx: Transaction, urlFactory: () => string, openBr
   finally { cleanup(); }
 }
 
-class AuthCore {
+/** Exported for integrations that supply their own fixed store; not part of the package entry. */
+export class AuthCore {
   #environment: Environment;
   #store?: AuthStore;
   #controllers = new Set<AbortController>();
@@ -237,36 +240,53 @@ class AuthCore {
     }
     return { accessToken: body.access_token, refreshToken: typeof body.refresh_token === 'string' ? body.refresh_token : undefined, idToken: typeof body.id_token === 'string' ? body.id_token : previous?.idToken, expiresAt: this.#environment.now() + body.expires_in * 1000, earliestRefreshAt, scopes, savedAt: new Date(this.#environment.now()).toISOString() };
   }
+  /**
+   * The browser consent can take minutes, so it runs without the cross-process
+   * lock: the lock is held only to read the host/registration before, and to
+   * record the result after. Other processes can refresh or sign out meanwhile;
+   * a conflicting change (another host state or a removed registration) fails
+   * this login instead of overwriting it.
+   */
   async login(options: LoginOptions = {}): Promise<AuthStatus> {
     const scope = await this.openRequestScope(options.signal);
-    try { return await this.#operation(signal => this.#storage().transaction(async (state, checkpoint) => {
-      const registration = options.registrationId ? state.registrations.find(r => r.id === options.registrationId) : undefined;
-      if (options.registrationId && !registration) throw new BridgeError('registration_not_found', '指定された登録がありません。');
-      const tx = transaction(this.#environment.now(), registration?.clientId);
-      const callback = await browserCallback(tx, () => authorizationURL(tx, state, registration, this.#environment.app.appName, options.forceConsent), this.#environment.openBrowser, this.#environment.now, signal);
-      // Preserve an issued registration even if a one-time authorization code expires.
-      const pending = registration ?? { id: randomUUID(), label: `ChatGPT registration ${state.registrations.length + 1}`, clientId: callback.clientId, planConfirmed: false };
-      if (!registration) { state.registrations.push(pending); await checkpoint(); }
-      const response = await this.#request(TOKEN, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', client_id: callback.clientId, code: callback.code, code_verifier: tx.verifier, redirect_uri: tx.redirectUri, resource: RESOURCE }) }, signal);
-      const body = await this.#json(response);
-      if (!response.ok) throw new BridgeError(body.error === 'invalid_grant' ? 'oauth_code_expired' : 'oauth_exchange_failed', 'ログインのコード交換が完了しませんでした。保存された登録を選んで再ログインしてください。', response.status);
-      if (typeof body.id_token !== 'string') throw new BridgeError('id_token_missing', '本人確認用のID tokenがありません。');
-      const identity = await this.#identity(body.id_token, callback.clientId, { nonce: tx.nonce, subject: registration?.subject }, signal);
-      const credentials = this.#credentials(body, undefined, identity.expiresAt);
-      await scope.check(); checkAbort(signal);
-      const selectionChanged = state.activeId !== pending.id;
-      pending.subject = identity.subject; pending.issuer = AUTH_ORIGIN; pending.credentials = credentials; delete pending.pendingRefresh;
-      state.activeId = pending.id;
-      if (selectionChanged) {
-        // Commit under the credential lock before invalidating every other
-        // process's request epoch. Detach this successful login from its own
-        // notification so the result remains a successful sign-in.
+    try { return await this.#operation(async signal => {
+      const plan = await this.#storage().transaction(async (state, checkpoint) => {
+        const registration = options.registrationId ? state.registrations.find(r => r.id === options.registrationId) : undefined;
+        if (options.registrationId && !registration) throw new BridgeError('registration_not_found', '指定された登録がありません。');
+        // Persist a new installation's host ID before it is sent in the authorization URL.
         await checkpoint();
-        scope.close();
-        await this.#storage().cancelRequests();
-      }
-      return sanitized(state, this.#environment.now());
-    }, signal), scope.signal); }
+        return { hostId: state.hostId, registration: registration ? structuredClone(registration) : undefined };
+      }, signal);
+      const tx = transaction(this.#environment.now(), plan.registration?.clientId);
+      const callback = await browserCallback(tx, () => authorizationURL(tx, { version: 1, hostId: plan.hostId, registrations: [] }, plan.registration, this.#environment.app.appName, options.forceConsent), this.#environment.openBrowser, this.#environment.now, signal);
+      return this.#storage().transaction(async (state, checkpoint) => {
+        if (state.hostId !== plan.hostId) throw new BridgeError('login_conflict', 'ログイン中に保存状態が変わりました。もう一度ログインしてください。');
+        const registration = plan.registration ? state.registrations.find(r => r.id === plan.registration!.id) : undefined;
+        if (plan.registration && (!registration || registration.clientId !== plan.registration.clientId)) throw new BridgeError('login_conflict', 'ログイン中に登録が削除または変更されました。もう一度ログインしてください。');
+        // Preserve an issued registration even if a one-time authorization code expires.
+        const pending = registration ?? { id: randomUUID(), label: `ChatGPT registration ${state.registrations.length + 1}`, clientId: callback.clientId, planConfirmed: false };
+        if (!registration) { state.registrations.push(pending); await checkpoint(); }
+        const response = await this.#request(TOKEN, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', client_id: callback.clientId, code: callback.code, code_verifier: tx.verifier, redirect_uri: tx.redirectUri, resource: RESOURCE }) }, signal);
+        const body = await this.#json(response);
+        if (!response.ok) throw new BridgeError(body.error === 'invalid_grant' ? 'oauth_code_expired' : 'oauth_exchange_failed', 'ログインのコード交換が完了しませんでした。保存された登録を選んで再ログインしてください。', response.status);
+        if (typeof body.id_token !== 'string') throw new BridgeError('id_token_missing', '本人確認用のID tokenがありません。');
+        const identity = await this.#identity(body.id_token, callback.clientId, { nonce: tx.nonce, subject: registration?.subject }, signal);
+        const credentials = this.#credentials(body, undefined, identity.expiresAt);
+        await scope.check(); checkAbort(signal);
+        const selectionChanged = state.activeId !== pending.id;
+        pending.subject = identity.subject; pending.issuer = AUTH_ORIGIN; pending.credentials = credentials; delete pending.pendingRefresh;
+        state.activeId = pending.id;
+        if (selectionChanged) {
+          // Commit under the credential lock before invalidating every other
+          // process's request epoch. Detach this successful login from its own
+          // notification so the result remains a successful sign-in.
+          await checkpoint();
+          scope.close();
+          await this.#storage().cancelRequests();
+        }
+        return sanitized(state, this.#environment.now());
+      }, signal);
+    }, scope.signal); }
     finally { scope.close(); }
   }
   async #refresh(registration: Registration, signal: AbortSignal, checkpoint: () => Promise<void>): Promise<void> {
@@ -297,37 +317,63 @@ class AuthCore {
       delete registration.pendingRefresh;
     }
     registration.credentials = credentials;
+    // The previous refresh token may already be invalid. Persist the rotated
+    // credentials before any further network call, with or without an id_token.
+    await checkpoint();
   }
-  async withAccessToken<T>(operation: (token: string, signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+  /**
+   * Run `operation` with a valid access token of the active registration. The
+   * third argument is the registration the token belongs to, read from the
+   * same credential snapshot, so callers can refuse history from another
+   * registration before sending anything.
+   *
+   * Reading a valid token never takes the cross-process lock. A refresh takes
+   * it only to rotate and persist the credentials; the request itself then
+   * runs on the shared path, so a slow response does not hold other processes.
+   */
+  async withAccessToken<T>(operation: (token: string, signal: AbortSignal, registrationId: string) => Promise<T>, signal?: AbortSignal): Promise<T> {
     const scope = await this.openRequestScope(signal);
-    try {
-      // Fast path: a still-valid token needs no OS lock and no write. The
-      // in-process queue is kept, so local select/sign-out ordering is unchanged.
-      const fast = await this.#operation(current => this.#storage().transaction(async state => {
-        const registration = active(state);
-        if (!registration.credentials) throw new BridgeError('sign_in_required', '保存された登録で再ログインしてください。');
-        if (!permitted(registration.credentials)) throw new BridgeError('plan_permission_required', 'ChatGPTプランの利用許可がありません。推論は送信しません。');
-        if (!registration.planConfirmed) throw new BridgeError('plan_confirmation_required', '初回のChatGPTプラン利用確認を行ってください。');
-        if (registration.pendingRefresh || registration.credentials.expiresAt - this.#environment.now() < 60_000) return { refresh: true as const };
-        await scope.check(); checkAbort(current);
-        const result = await operation(registration.credentials.accessToken, current);
-        await scope.check(); checkAbort(current);
-        return { refresh: false as const, result };
-      }, current, { shared: true }), scope.signal);
-      if (!fast.refresh) return fast.result;
-      // Refresh rotates the refresh token: only under the cross-process lock.
-      return await this.#operation(current => this.#storage().transaction(async (state, checkpoint) => {
-      const registration = active(state);
+    const usable = (registration: Registration): Credentials => {
       if (!registration.credentials) throw new BridgeError('sign_in_required', '保存された登録で再ログインしてください。');
       if (!permitted(registration.credentials)) throw new BridgeError('plan_permission_required', 'ChatGPTプランの利用許可がありません。推論は送信しません。');
       if (!registration.planConfirmed) throw new BridgeError('plan_confirmation_required', '初回のChatGPTプラン利用確認を行ってください。');
-      if (registration.pendingRefresh || registration.credentials.expiresAt - this.#environment.now() < 60_000) await this.#refresh(registration, current, checkpoint);
-      if (!permitted(registration.credentials)) throw new BridgeError('plan_permission_required', '更新後のChatGPTプラン利用許可がありません。推論は送信しません。');
+      return registration.credentials;
+    };
+    const stale = (registration: Registration) => !!registration.pendingRefresh || usable(registration).expiresAt - this.#environment.now() < 60_000;
+    const shared = () => this.#operation(current => this.#storage().transaction(async state => {
+      const registration = active(state);
+      if (stale(registration)) return { refresh: true as const };
       await scope.check(); checkAbort(current);
-      const result = await operation(registration.credentials!.accessToken, current);
+      const result = await operation(usable(registration).accessToken, current, registration.id);
       await scope.check(); checkAbort(current);
-      return result;
-    }, current), scope.signal);
+      return { refresh: false as const, result };
+    }, current, { shared: true }), scope.signal);
+    try {
+      const fast = await shared();
+      if (!fast.refresh) return fast.result;
+      // Refresh rotates the refresh token: only under the cross-process lock, and
+      // persisted (checkpoint) before the lock is released.
+      const refreshed = await this.#operation(current => this.#storage().transaction(async (state, checkpoint) => {
+        const registration = active(state);
+        if (stale(registration)) await this.#refresh(registration, current, checkpoint);
+        usable(registration);
+        return !stale(registration);
+      }, current), scope.signal);
+      if (refreshed) {
+        const next = await shared();
+        if (!next.refresh) return next.result;
+      }
+      // A token that could not be renewed yet (earliest refresh time not reached)
+      // but has not expired is still used once, under the lock, as before.
+      return await this.#operation(current => this.#storage().transaction(async state => {
+        const registration = active(state);
+        const credentials = usable(registration);
+        if (registration.pendingRefresh || credentials.expiresAt <= this.#environment.now()) throw new BridgeError('sign_in_required', '資格情報を更新できませんでした。保存された登録で再ログインしてください。');
+        await scope.check(); checkAbort(current);
+        const result = await operation(credentials.accessToken, current, registration.id);
+        await scope.check(); checkAbort(current);
+        return result;
+      }, current), scope.signal);
     } finally { scope.close(); }
   }
   async signOut(signal?: AbortSignal): Promise<{ remoteRevocation: 'confirmed' | 'unconfirmed' }> {
@@ -374,8 +420,9 @@ export class AuthManager extends AuthCore {
   }
 }
 /** Test-only factory always owns a fresh memory store; cannot load production credentials. */
-export function createAuthTestHarness(options: { appId?: string; appName?: string; seed?: CredentialState; testDirectory?: string; transport: Transport; openBrowser: (url: string) => Promise<void>; now?: () => number; onRequest?: (kind: 'auth', signal: AbortSignal) => Promise<void> }): AuthCore {
+export function createAuthTestHarness(options: { appId?: string; appName?: string; seed?: CredentialState; testDirectory?: string; transport: Transport; openBrowser: (url: string) => Promise<void>; now?: () => number; onRequest?: (kind: 'auth', signal: AbortSignal) => Promise<void>; observeStore?: (store: AuthStore) => AuthStore }): AuthCore {
   if (options.seed && options.testDirectory) throw new BridgeError('test_store_invalid', 'テストストアへのseed混在はできません。');
-  const store = options.testDirectory ? createWindowsTestStore(options.testDirectory) : createMemoryTestStore(options.seed);
+  const base = options.testDirectory ? createWindowsTestStore(options.testDirectory) : createMemoryTestStore(options.seed);
+  const store = options.observeStore ? options.observeStore(base) : base;
   return new AuthCore({ app: { appId: options.appId ?? 'siwc-test-app', appName: options.appName ?? 'SIWC test app' }, store: () => store, transport: options.transport, openBrowser: options.openBrowser, onRequest: options.onRequest, now: options.now ?? Date.now });
 }

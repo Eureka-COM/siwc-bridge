@@ -1,7 +1,9 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-commands';
-import { LlmError } from '@deepseek-ai/dsh-llm';
+import { LlmError, resolveImageAttachmentAccess } from '@deepseek-ai/dsh-llm';
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
+import type { ImageSource } from './adapter.js';
 import { createServices, PRIVACY_NOTICE, MANAGE_USAGE, CREDIT_NOTICE, startMessage, saveModel, statusText } from './admin.js';
 import { safeFailure } from './errors.js';
 import { resumeInference, startPersonalUse } from './ledger.js';
@@ -10,32 +12,25 @@ export const name = 'dsh-siwc-bridge';
 export const inject = ['llm'];
 /** Registers one provider, existing dsh slash commands, and input rejection. No tool executor. */
 export function apply(ctx: Context): void {
-  const { auth, adapter } = createServices();
+  const { auth, adapter } = createServices({
+    // Resolved per request: the attachment and filesystem services may start after this plugin.
+    attachments: () => (ctx as unknown as { get(name: string): ImageSource | undefined }).get('attachments'),
+    imageAccess: (attachments, ref) => resolveImageAttachmentAccess(attachments as AttachmentStore,
+      hostPath => (ctx as unknown as { get(name: string): { processPathFromHostPath(path: string): string | undefined } | undefined }).get('fs')?.processPathFromHostPath(hostPath), ref),
+  });
   const registration = ctx.llm.registerAdapter(['siwc'], adapter);
   // A background catalog refresh that changed the list re-notifies the selector.
   adapter.onCatalogUpdated = () => registration.replace(['siwc']);
   ctx.effect(() => () => { adapter.cancelRequests(); auth.abortAll(); });
-  // Public LlmRuntime.stream can also be called without an Agent. Reject raw
-  // attachments before the host projects them into text at its adapter boundary.
+  // Public LlmRuntime.stream can also be called without an Agent. Text, tool calls,
+  // tool changes and attachments (images natively, files as DSH's read-only path
+  // text) are supported; reject anything else before the host projects it.
   ctx.on('llm/stream', async function* (options, next) {
-    if (options.provider === 'siwc' && options.messages.some(m => m.content.some(b => b.type !== 'text' && b.type !== 'tool-call' && b.type !== 'reasoning'
+    if (options.provider === 'siwc' && options.messages.some(m => m.content.some(b => !['text', 'tool-call', 'reasoning', 'image', 'file'].includes(b.type)
       && !((m.role === 'developer' || m.role === 'system') && (b.type === 'tool-addition' || b.type === 'tool-removal'))))) {
-      throw new LlmError('SIWC初期版はテキストとローカルfunction toolの履歴だけに対応しています。添付は送信できません。', 'UNSUPPORTED_CONTENT');
+      throw new LlmError('SIWCでは送信できない種類の内容が含まれています。', 'UNSUPPORTED_CONTENT');
     }
     yield* next();
-  });
-  ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
-    if (agent.options.provider === 'siwc' && messages.some(m => m.content.some(b => b.type === 'image' || b.type === 'file'))) {
-      throw new LlmError('SIWC初期版は画像・ファイル添付に未対応です。テキストまたはdshのローカルreadを使用してください。', 'UNSUPPORTED_CONTENT');
-    }
-    return next();
-  });
-  ctx.on('agent/request', async ({ agent }, next) => {
-    const config = await next();
-    if (config.provider === 'siwc' && agent.session.deriveMessages().some(m => m.content.some(b => b.type === 'image' || b.type === 'file'))) {
-      throw new LlmError('保存された履歴に未対応の画像・ファイル添付があります。テキストだけの会話で使用してください。', 'UNSUPPORTED_CONTENT');
-    }
-    return config;
   });
   ctx.inject(['commands'], commandCtx => {
     let privacyShown = false;

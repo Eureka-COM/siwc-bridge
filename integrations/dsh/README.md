@@ -27,7 +27,7 @@ npm.cmd start                  # DSHの画面を開く
 
 ChatGPTの設定によっては、**プランの利用枠を使い切った後に、有料のクレジットが自動で使われる**ことがあります。使い始める前に、[ChatGPT Settings → Usage](https://chatgpt.com/settings/usage) の **App limits → SIWC Bridge for DSH** で、週間上限を100%未満にするか、クレジット利用をOFFにして保存してください。自動購入をOFFにするだけでは、すでにあるクレジットの消費は防げません（[公式の説明](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites)）。
 
-アプリ名「SIWC Bridge for DSH」は、最初のログインの後にUsageの一覧へ表示されます。利用上限のエラーを受けたときは推論を止め、`resume` を実行するまで再開しません。
+アプリ名「SIWC Bridge for DSH」は、最初のログインの後にUsageの一覧へ表示されます。利用上限のエラーを受けたときは推論を止め、本人が再開するまで再開しません（DSH画面の `/siwc resume confirmed`、またはターミナルの `node lib/cli.js resume`。どちらで再開しても、起動中のDSHに反映されます）。
 
 ## 前提と確認した版
 
@@ -125,9 +125,15 @@ SIWC経由のChatGPTプラン利用には、Fast（優先処理）を指定す�
 
 ## 対応範囲と停止
 
-対応はテキスト会話、namespace内のローカルfunction tool、tool結果・履歴・不透明なreasoning itemの返却、SSE、usageがある場合の変換、キャンセルです。成功にはresponse.completedが必要で、途中切断・failed・incomplete・不正JSONではtoolを実行しません。
+対応はテキスト会話、画像・ファイルの添付、namespace内のローカルfunction tool、tool結果・履歴・不透明なreasoning itemの返却、SSE、usageがある場合の変換、キャンセルです。成功にはresponse.completedが必要で、途中切断・failed・incomplete・不正JSONではtoolを実行しません。
 
-画像・音声・ファイル添付、hosted tools、background、temperature、top_p、max_output_tokens、previous_response_idなどは未対応です。明示指定は送信前にエラーにします。dshのローカルreadはファイル添付とは別です。
+### 画像・ファイルの添付
+
+DSH画面で添付した**画像**は、DSHの添付サービスから送信用の版（最大2048×2048ピクセル・約1 MiB）を読み出し、Responses APIの `input_image` として送ります。ツール結果に含まれる画像も同じ形式で返します。1回の要求に含める画像は合計約20 MiB（base64換算）までで、超える場合はDSHの標準機能で古い画像から文字の参照に置き換えて再実行します。画像を受け付けないモデルでは、サービスの拒否がそのままエラーとして表示されます。
+
+**ファイル**は、DSHの設計どおり中身を直接送りません。DSHが保存した読み取り専用の場所を文字で伝え、モデルが必要なときにDSHのreadツールで読みます（読み取りはDSHの通常の権限確認に従います）。
+
+音声、hosted tools、background、temperature、top_p、max_output_tokens、previous_response_idなどは未対応です。明示指定は送信前にエラーにします。
 
 401は認証・許可を確認、403は資格・地域・policyを確認、ChatGPT の利用上限・利用枠不明のエラーは新規推論停止、503は資格情報を保持して本人が後で再実行します。利用枠エラーの停止は専用要求記録へ保存し、Web や別プロセスの再起動だけでは解除しません。推論の自動再試行は0回。失効の一時障害だけ有限2試行です。上限の種類・復旧時刻は推測しません。`/siwc resume` だけでは再開しません。本人が公式 Usage のクレジット不使用設定を保存・確認した後、`/siwc resume confirmed` または対話ターミナルで `node lib/cli.js resume` の `START` 入力を行うと、停止前の検証／通常個人利用モードを復元します。要求の累計はリセットせず、検証の6要求上限も保持します。開始したことのない状態や、6要求を使い切った検証の再開は拒否します。新しい検証は `npm.cmd run live-test -- --begin` で開始し、残りが2要求未満ならツール往復を開始できません。APIキー従量課金・別アカウント・別providerへのfallbackはありません。追加料金の有無は本人のクレジット設定によります。
 

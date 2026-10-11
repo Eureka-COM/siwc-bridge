@@ -73,7 +73,7 @@ npm.cmd ci --ignore-scripts --no-audit --no-fund
 npm.cmd run build
 ```
 
-別の利用アプリへ導入する場合は、ここで`npm.cmd run release:local`を実行し、利用アプリのフォルダから`npm.cmd install --ignore-scripts <展開先>/artifacts/siwc-bridge-0.2.1.tgz`を実行します。`npm install siwc-bridge`によるレジストリ取得は提供していません。
+別の利用アプリへ導入する場合は、ここで`npm.cmd run release:local`を実行し、利用アプリのフォルダから`npm.cmd install --ignore-scripts <展開先>/artifacts/siwc-bridge-0.2.2.tgz`を実行します。`npm install siwc-bridge`によるレジストリ取得は提供していません。
 
 ## SDKの本人ログインと開始
 
@@ -155,7 +155,9 @@ const finalResponse = await runtime.client.complete({ model, input, tools });
 
 `selectedModelSlug` と `executeApprovedLocalTool` は利用アプリが用意します。`complete` は `{ model, output, usage? }` を返します。使用量が応答にない場合は `usage` を捏造しません。中断には `signal: AbortSignal` を渡せます。アプリ内の停止操作は `await runtime.stop()` に結び付けます。
 
-下位の `SiwcClient` コンストラクタは資格情報源と必須の `RequestObserver.beforeRequest` を受け取り、呼び出し側が開始・予算・権限のポリシーを担います。独自のホストは `onUsageLimit` で共有の開始許可を持続的に無効化してください。Windows アプリでの通常導入には、この停止処理も組み込んだ `createWindowsClient` を使用してください。
+下位の `SiwcClient` コンストラクタは資格情報源と必須の `RequestObserver.beforeRequest` を受け取り、呼び出し側が開始・予算・権限のポリシーを担います。独自のホストは `onUsageLimit` で共有の開始許可を持続的に無効化してください。`usageState` も渡すと、別プロセスで本人が開始し直したとき（世代番号が進んだとき）に、このプロセスの停止も解除されます。Windows アプリでの通常導入には、これらを組み込んだ `createWindowsClient` を使用してください。
+
+独自の資格情報源を実装する場合、`withAccessToken` のコールバックの第3引数に、**そのトークンと同じ保存状態から読んだ登録ID**を渡してください。`status` を持つ資格情報源では、送信前にこの登録IDと会話履歴の登録を照合し、一致しない要求は送りません（v0.2.2）。登録IDを渡さない資格情報源は、新しい会話は使えますが、履歴の再利用は拒否されます。
 
 native output と opaque reasoning の再利用は、同じ `SiwcClient`・同じアカウント登録・同じモデルの範囲です。同じプロセスでの JSON clone は利用できます。未知の暗号 reasoning をファイルへ保存して再起動後に復元する履歴は未対応です。別アプリ・別登録・別モデルへ opaque reasoning を移さないでください。会話履歴の保存や削減は呼び出し側が管理します。
 
@@ -203,7 +205,7 @@ npm.cmd run release:local
 
 **SDKとDSH接続の実アカウント推論・公式Usageへの計上・請求は、このリポジトリの検証では確認していません。** 検証の範囲は[DSH接続の検証記録](integrations/dsh/docs/VERIFICATION.md)にまとめています。
 
-SDK初期版はテキストとローカルfunction tool向けです。画像・音声・ファイル添付、hosted tools、backgroundなどは未対応です。詳細な引数制約は[仕様照合](docs/COMPLIANCE.md)に記録しています。DSHのローカルreadはファイル添付とは別です。
+SDKはテキストとローカルfunction tool向けです。SDKでの画像・音声・ファイル添付、hosted tools、backgroundなどは未対応です（DSH接続は画像・ファイルの添付に対応しています）。詳細な引数制約は[仕様照合](docs/COMPLIANCE.md)に記録しています。DSHのローカルreadはファイル添付とは別です。
 
 `release:local`は`artifacts/`へソースZIP・ビルド済みSDKのtgz・内容一覧・SHA256を作成します。node_modulesやビルド生成物、個人状態、資格情報、ログはソースZIPに含めません。GitHubやnpmへ公開する操作ではありません。
 

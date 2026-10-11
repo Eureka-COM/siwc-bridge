@@ -1,11 +1,17 @@
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { join, relative, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { paths, runNode, resolveNpmCli } from './dsh-env.mjs';
 import { hasSecretCandidate, isPrivatePath } from './publication-safety.mjs';
 
+/** The OS PowerShell by absolute path; never resolved through the working directory or PATH. */
+function systemPowerShell() {
+  const root = process.env.SystemRoot;
+  if (!root || !isAbsolute(root) || root.startsWith('\\\\')) throw new Error('WindowsのシステムPowerShellを確認できません。');
+  return join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
 const destination = join(paths.root, 'artifacts');
 const checkOnly = process.argv.includes('--check-only');
 await mkdir(destination, { recursive: true });
@@ -29,9 +35,9 @@ for (const file of files) {
 }
 const manifest = join(destination, 'source-manifest.json');
 if (!checkOnly) await writeFile(manifest, JSON.stringify(inventory, null, 2) + '\n');
-const zip = join(destination, 'dsh-siwc-bridge-0.2.1-source.zip');
+const zip = join(destination, 'dsh-siwc-bridge-0.2.2-source.zip');
 // .NET ZIP writer is the OS library; JSON file paths travel through an env field.
-if (!checkOnly) await promisify(execFile)('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop"; Add-Type -AssemblyName System.IO.Compression; $rows=Get-Content -LiteralPath $env:DSH_SOURCE_MANIFEST -Encoding UTF8 | ConvertFrom-Json; $f=[IO.File]::Open($env:DSH_SOURCE_ZIP,[IO.FileMode]::Create); $z=New-Object IO.Compression.ZipArchive($f,[IO.Compression.ZipArchiveMode]::Create,$false); try { foreach($r in $rows) { $e=$z.CreateEntry($r.file,[IO.Compression.CompressionLevel]::Optimal); $e.LastWriteTime=[DateTimeOffset]::Parse("1980-01-01T00:00:00+00:00"); $s=$e.Open(); try { $b=[IO.File]::ReadAllBytes([IO.Path]::Combine($env:DSH_SOURCE_ROOT,$r.file)); $s.Write($b,0,$b.Length) } finally { $s.Dispose() } } } finally { $z.Dispose(); $f.Dispose() }'], { windowsHide: true, env: { ...process.env, DSH_SOURCE_MANIFEST: manifest, DSH_SOURCE_ZIP: zip, DSH_SOURCE_ROOT: paths.root } });
+if (!checkOnly) await promisify(execFile)(systemPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop"; Add-Type -AssemblyName System.IO.Compression; $rows=Get-Content -LiteralPath $env:DSH_SOURCE_MANIFEST -Encoding UTF8 | ConvertFrom-Json; $f=[IO.File]::Open($env:DSH_SOURCE_ZIP,[IO.FileMode]::Create); $z=New-Object IO.Compression.ZipArchive($f,[IO.Compression.ZipArchiveMode]::Create,$false); try { foreach($r in $rows) { $e=$z.CreateEntry($r.file,[IO.Compression.CompressionLevel]::Optimal); $e.LastWriteTime=[DateTimeOffset]::Parse("1980-01-01T00:00:00+00:00"); $s=$e.Open(); try { $b=[IO.File]::ReadAllBytes([IO.Path]::Combine($env:DSH_SOURCE_ROOT,$r.file)); $s.Write($b,0,$b.Length) } finally { $s.Dispose() } } } finally { $z.Dispose(); $f.Dispose() }'], { windowsHide: true, env: { ...process.env, DSH_SOURCE_MANIFEST: manifest, DSH_SOURCE_ZIP: zip, DSH_SOURCE_ROOT: paths.root } });
 const packed = await runNode(resolveNpmCli(), ['pack', '--ignore-scripts', '--json', ...(checkOnly ? ['--dry-run'] : []), '--pack-destination', destination], { cwd: paths.root, capture: true });
 if (packed.code !== 0) throw new Error('npm pack が失敗しました。');
 const meta = JSON.parse(packed.stdout)[0];

@@ -1,4 +1,5 @@
 import type { GenerateOptions, RequestMessage, StreamChunk, TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm';
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import { isDeepStrictEqual } from 'node:util';
 import { BridgeError } from './errors.js';
 import { reasoningRequest } from './reasoning.js';
@@ -54,11 +55,40 @@ export function providerFailure(body: unknown, status?: number, requestId?: unkn
   return new ProviderFailure(code, messages[code] ?? 'SIWC要求が拒否または中断されました。秘密を含み得るサービス本文は表示しません。', status, id, param, shape);
 }
 
+/** Encoded request version of one attached image, prepared by the adapter from DSH's attachment service. */
+export interface RequestImage { data: Uint8Array; mediaType: string; width: number; height: number }
+/** Images ready to send, plus the model-facing handle text DSH uses for every image occurrence. */
+export interface RequestMedia {
+  images: ReadonlyMap<string, RequestImage>;
+  handle: (ref: ImageAttachmentRef, version: RequestImage) => string;
+}
+const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+
 function textContent(message: RequestMessage): string {
   return message.content.map(block => {
-    if (block.type !== 'text') throw new BridgeError('UNSUPPORTED_CONTENT', '初期版はテキストとローカルfunction toolだけに対応しています。画像・ファイル・音声・未知のcontentは送信できません。');
+    if (block.type !== 'text') throw new BridgeError('UNSUPPORTED_CONTENT', message.role === 'user' || message.role === 'tool'
+      ? 'この添付は送信形式に変換できませんでした。DSHを再起動して添付し直してください。'
+      : 'system・developer・assistantの履歴には画像やファイルを含められません。');
     return block.text;
   }).join('\n');
+}
+
+/** User and tool content: text, plus images as native Responses input parts. Files never reach here (DSH projects them to text). */
+function richContent(message: RequestMessage, media?: RequestMedia): string | Record<string, unknown>[] {
+  if (!message.content.some(block => block.type === 'image')) return textContent(message);
+  if (!media) throw new BridgeError('UNSUPPORTED_CONTENT', '画像を読み込めませんでした。DSHの添付機能が有効か確認してください。');
+  const parts: Record<string, unknown>[] = [];
+  for (const block of message.content) {
+    if (block.type === 'text') { if (block.text !== '') parts.push({ type: 'input_text', text: block.text }); continue; }
+    if (block.type !== 'image') throw new BridgeError('UNSUPPORTED_CONTENT', 'この添付は送信形式に変換できませんでした。DSHを再起動して添付し直してください。');
+    const version = media.images.get(block.attachment.attachmentId);
+    if (!version || !IMAGE_TYPES.has(version.mediaType) || !(version.data instanceof Uint8Array) || version.data.byteLength === 0) {
+      throw new BridgeError('UNSUPPORTED_CONTENT', '添付画像を送信用に準備できませんでした。添付し直してください。');
+    }
+    parts.push({ type: 'input_text', text: media.handle(block.attachment, version) });
+    parts.push({ type: 'input_image', image_url: `data:${version.mediaType};base64,${Buffer.from(version.data).toString('base64')}`, detail: 'auto' });
+  }
+  return parts;
 }
 
 function functionItem(value: unknown, allowed?: ReadonlySet<string>): Record<string, unknown> {
@@ -73,7 +103,7 @@ function functionItem(value: unknown, allowed?: ReadonlySet<string>): Record<str
 }
 
 /** Build an allowlisted request; ordinary API options never pass through. */
-export function buildRequest(options: GenerateOptions, registrationId?: string): Record<string, unknown> {
+export function buildRequest(options: GenerateOptions, registrationId?: string, media?: RequestMedia): Record<string, unknown> {
   const allowed = new Set(['provider', 'model', 'messages', 'system', 'tools', 'toolHistory', 'signal', 'sessionId', 'purpose', 'reasoningEffort']);
   for (const [key, value] of Object.entries(options)) {
     if (value !== undefined && !allowed.has(key)) throw new BridgeError('UNSUPPORTED_OPTION', `SIWC初期版では ${/^[A-Za-z_]+$/.test(key) ? key : '指定されたオプション'} に対応していません。`);
@@ -88,7 +118,7 @@ export function buildRequest(options: GenerateOptions, registrationId?: string):
     if (message.role === 'tool') {
       if (!calls.has(message.toolCallId) || answered.has(message.toolCallId)) throw new BridgeError('INVALID_TOOL_HISTORY', 'ツール結果のcall IDに対応する呼出しがないか、結果が重複しています。');
       answered.add(message.toolCallId);
-      input.push({ type: 'function_call_output', call_id: message.toolCallId, output: textContent(message) });
+      input.push({ type: 'function_call_output', call_id: message.toolCallId, output: richContent(message, media) });
       continue;
     }
     if (message.role === 'assistant') {
@@ -158,6 +188,11 @@ export function buildRequest(options: GenerateOptions, registrationId?: string):
       continue;
     }
     if (!['system', 'developer', 'user'].includes(message.role)) throw new BridgeError('UNSUPPORTED_CONTENT', '未対応の会話roleです。');
+    if (message.role === 'user') {
+      const content = richContent(message, media);
+      if (content !== '' && !(Array.isArray(content) && content.length === 0)) input.push({ role: 'user', content });
+      continue;
+    }
     const text = textContent(message);
     if (text !== '') input.push({ role: message.role === 'system' ? 'developer' : message.role, content: text });
   }

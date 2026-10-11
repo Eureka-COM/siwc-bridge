@@ -1,7 +1,7 @@
 import { AuthManager, type AuthStatus } from './auth.js';
-import { SiwcAdapter } from './adapter.js';
+import { SiwcAdapter, type AdapterOptions } from './adapter.js';
 import { diskCatalogStore } from './local-cache.js';
-import { recordRequest, verificationStatus, stopInference } from './ledger.js';
+import { recordRequest, verificationStatus, stopInference, usageState } from './ledger.js';
 import { BridgeError } from './errors.js';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
@@ -16,10 +16,10 @@ export function startMessage(result: 'started' | 'already' | 'stopped' | 'verifi
     : 'ライブ検証の実行中です。終了する場合は finish-verification を実行してください。';
 }
 export const PRIVACY_NOTICE = 'この個人開発プラグインは、本人が許可したChatGPT登録情報をWindowsのCurrentUser DPAPIで保護してローカルに保存し、選択した会話履歴とdshのツール定義・結果をOpenAIの公開APIへ送信します。既存のChatGPT会話を取得しません。追加料金は本人のクレジット設定に従うため、ChatGPTのManage usageで確認してください。パスワード・Cookie・トークンをチャットへ入力しないでください。';
-export function createServices() {
+export function createServices(media: Pick<AdapterOptions, 'attachments' | 'imageAccess'> = {}) {
   const auth = new AuthManager(recordRequest);
-  const adapter = new SiwcAdapter(auth, { beforeRequest: (kind, signal) => recordRequest(kind, signal), onUsageLimit: stopInference },
-    { catalogStore: diskCatalogStore() });
+  const adapter = new SiwcAdapter(auth, { beforeRequest: (kind, signal) => recordRequest(kind, signal), onUsageLimit: stopInference, usageState },
+    { catalogStore: diskCatalogStore(), ...media });
   return { auth, adapter };
 }
 function selectionFile(): string {
@@ -46,5 +46,5 @@ export function formatStatus(status: AuthStatus, model: string | undefined, limi
   return ['ChatGPT plan (SIWC)', ...rows, `モデル: ${model ?? '未選択'}`, `利用上限: ${limited ? '新規推論停止。Manage usageを確認' : '未検出（残量は未確認）'}`, `Manage usage: ${MANAGE_USAGE}`].join('\n');
 }
 export async function statusText(auth: AuthManager, adapter: SiwcAdapter): Promise<string> {
-  return formatStatus(await auth.status(), await selectedModel(auth), adapter.isUsageLimited()) + '\n要求件数: ' + JSON.stringify(await verificationStatus());
+  return formatStatus(await auth.status(), await selectedModel(auth), await adapter.usageLimited()) + '\n要求件数: ' + JSON.stringify(await verificationStatus());
 }

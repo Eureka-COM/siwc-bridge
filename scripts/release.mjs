@@ -1,11 +1,17 @@
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
-import { join, dirname, relative } from 'node:path';
+import { join, dirname, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { hasSecretCandidate, isPrivatePath } from './publication-safety.mjs';
 
+/** The OS PowerShell by absolute path; never resolved through the working directory or PATH. */
+function systemPowerShell() {
+  const root = process.env.SystemRoot;
+  if (!root || !isAbsolute(root) || root.startsWith('\\\\')) throw new Error('WindowsのシステムPowerShellを確認できません。');
+  return join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const destination = join(root, 'artifacts');
 const checkOnly = process.argv.includes('--check-only');
@@ -34,8 +40,8 @@ for (const file of files) {
 await mkdir(destination, { recursive: true });
 const manifest = join(destination, 'source-manifest.json');
 if (!checkOnly) await writeFile(manifest, JSON.stringify(inventory, null, 2) + '\n');
-const zip = join(destination, 'siwc-bridge-0.2.1-source.zip');
-if (!checkOnly) await promisify(execFile)('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+const zip = join(destination, 'siwc-bridge-0.2.2-source.zip');
+if (!checkOnly) await promisify(execFile)(systemPowerShell(), ['-NoProfile', '-NonInteractive', '-Command',
   '$ErrorActionPreference="Stop"; Add-Type -AssemblyName System.IO.Compression; $rows=Get-Content -LiteralPath $env:SIWC_RELEASE_MANIFEST -Encoding UTF8 | ConvertFrom-Json; $f=[IO.File]::Open($env:SIWC_RELEASE_ZIP,[IO.FileMode]::Create); $z=New-Object IO.Compression.ZipArchive($f,[IO.Compression.ZipArchiveMode]::Create,$false); try { foreach($r in $rows) { $e=$z.CreateEntry($r.file,[IO.Compression.CompressionLevel]::Optimal); $e.LastWriteTime=[DateTimeOffset]::Parse("1980-01-01T00:00:00+00:00"); $s=$e.Open(); try { $b=[IO.File]::ReadAllBytes([IO.Path]::Combine($env:SIWC_RELEASE_ROOT,$r.file)); $s.Write($b,0,$b.Length) } finally { $s.Dispose() } } } finally { $z.Dispose(); $f.Dispose() }'],
   { windowsHide: true, env: { ...process.env, SIWC_RELEASE_MANIFEST: manifest, SIWC_RELEASE_ZIP: zip, SIWC_RELEASE_ROOT: root } });
 const npm = process.env.npm_execpath ?? join(dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');

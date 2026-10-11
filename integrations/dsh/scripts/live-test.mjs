@@ -34,7 +34,7 @@ const current = await verificationStatus();
 if (current.inference > 4) throw new Error(`残る検証予算では2要求のtool往復を開始できません（使用${current.inference}/6）。`);
 await armVerification();
 await initializeProfile('siwc-live', 'headless');
-const sourceArchive = join(paths.work, 'packages', 'dsh-siwc-bridge-0.2.1.tgz');
+const sourceArchive = join(paths.work, 'packages', 'dsh-siwc-bridge-0.2.2.tgz');
 if (!existsSync(sourceArchive)) throw new Error('先に npm.cmd run setup を実行してください。推論0件。');
 const archive = await verifiedArchive(sourceArchive);
 const installed = await runDsh(['plugin', '--profile', 'siwc-live', 'add', '--ignore-scripts', archive], { capture: true, timeoutMs: 180_000 });

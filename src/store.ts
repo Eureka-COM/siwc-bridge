@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir, lstat, open, readFile, rename, unlink, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -74,6 +75,22 @@ async function serialized<T>(key: string, operation: () => Promise<T>, signal?: 
   finally { signal.removeEventListener('abort', abort); }
 }
 
+/**
+ * The Windows PowerShell shipped with the OS, by absolute path. A bare
+ * "powershell.exe" would be resolved through the working directory and PATH,
+ * so a same-named program placed there could run instead. There is no
+ * fallback to the bare name: an unresolvable path refuses to start.
+ */
+export function systemPowerShell(): string {
+  const root = process.env.SystemRoot ?? process.env.windir;
+  if (process.platform !== 'win32' || !root || !isAbsolute(root) || root.startsWith('\\\\') || !/^[A-Za-z]:\\/.test(root)) {
+    throw new BridgeError('powershell_unavailable', 'WindowsのシステムPowerShellを確認できません。');
+  }
+  const path = join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  if (!existsSync(path)) throw new BridgeError('powershell_unavailable', 'WindowsのシステムPowerShellを確認できません。');
+  return path;
+}
+
 interface PipeSession { read(): Promise<string>; write(value: string): void; close(): void; closed: Promise<void>; }
 async function helper(mode: string, value: string, signal?: AbortSignal): Promise<PipeSession> {
   checkAbort(signal);
@@ -87,7 +104,7 @@ async function helper(mode: string, value: string, signal?: AbortSignal): Promis
   const abort = () => stop();
   function stop() { if (terminated) return; terminated = true; socket?.destroy(); child?.kill(); clearTimeout(timeout); signal?.removeEventListener('abort', abort); }
   signal?.addEventListener('abort', abort, { once: true });
-  child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-PipeName', pipeName, '-Mode', mode], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  child = spawn(systemPowerShell(), ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-PipeName', pipeName, '-Mode', mode], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
   const closed = new Promise<void>(resolve => { child.once('exit', () => resolve()); child.once('error', () => resolve()); });
   try {
     await new Promise<void>((accept, reject) => {
@@ -266,7 +283,8 @@ function validateState(value: unknown): CredentialState {
 
 export class WindowsStore implements AuthStore {
   #directory: string;
-  constructor(appId: string) { this.#directory = appDirectory(appId); }
+  /** `directory` is for an integration that already owns a fixed per-app folder; the package entry never exposes it. */
+  constructor(appId: string, directory?: string) { this.#directory = directory ?? appDirectory(appId); }
   async transaction<T>(operation: (state: CredentialState, checkpoint: () => Promise<void>) => Promise<T>, signal?: AbortSignal, options?: TransactionOptions): Promise<T> {
     return diskTransaction(this.#directory, operation, signal, options);
   }

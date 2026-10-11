@@ -25,3 +25,4 @@ secret*.json
 .local/
 .state/
 .cache/
+src/core/

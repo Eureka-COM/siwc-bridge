@@ -1,18 +1,43 @@
-import { LlmAdapter, LlmError, attributionHeaders, type GenerateOptions, type LlmModelInfo, type LlmResolvedModelInfo, type ResolvedRetryPolicy, type StreamChunk } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter, LlmError, IMAGE_OFFLOAD_REQUIRED_CODE, attributionHeaders, contentHasImage, offloadedImageText, projectOffloadedImages, requestImageHandleText, requiredImageOffload,
+  type GenerateOptions, type ImageAttachmentAccess, type LlmModelInfo, type LlmResolvedModelInfo, type ResolvedRetryPolicy, type StreamChunk } from '@deepseek-ai/dsh-llm';
+import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import { BridgeError, rememberFailure } from './errors.js';
 import { readText } from './http.js';
 import { reasoningForModel } from './reasoning.js';
 import type { CatalogStore } from './local-cache.js';
-import { buildRequest, object, ProviderFailure, providerFailure, readSse, ResponseStream } from './protocol.js';
+import { buildRequest, object, ProviderFailure, providerFailure, readSse, ResponseStream, type RequestImage, type RequestMedia } from './protocol.js';
 
 export interface CredentialSource {
   withAccessToken<T>(operation: (token: string, currentSignal?: AbortSignal, registrationId?: string) => Promise<T>, signal?: AbortSignal): Promise<T>;
   openRequestScope?: (signal?: AbortSignal) => Promise<{ signal: AbortSignal; check?(): Promise<void>; close(): void }>;
   status?: (signal?: AbortSignal) => Promise<{ activeId?: string; registrations?: readonly { id: string; authenticated: boolean; planAllowed: boolean; planConfirmed: boolean }[] }>;
 }
+/** The part of DSH's attachment service the adapter uses: read one request-sized image version. */
+export type ImageSource = Pick<AttachmentStore, 'readImageRequest'>;
 export interface AdapterOptions {
   /** Last account catalog (slugs and display names only), shown at once while a background refresh runs. */
   catalogStore?: CatalogStore;
+  /** DSH's attachment service, resolved per request; absent means images cannot be sent. */
+  attachments?: () => ImageSource | undefined;
+  /** Read-only path of an image in the tool environment, named in the text DSH places beside every image. */
+  imageAccess?: (attachments: ImageSource, ref: ImageAttachmentRef) => ImageAttachmentAccess | undefined;
+}
+/** Every listed ChatGPT model is offered for text and images; a model that refuses images fails at the service, visibly. */
+export const INPUT_MODALITIES = ['text', 'image'] as const;
+/** Same request-image policy as DSH's bundled adapters: 2048x2048 pixels, about 1 MiB per image, 20 MiB of base64 per request. */
+export const IMAGE_POLICY = { maxPixels: 2048 * 2048, maxBytes: 1024 * 1024, maxRequestBase64: 20 * 1024 * 1024 } as const;
+/** DSH's own fit-within-pixel-budget rule, keeping the aspect ratio. */
+export function requestImageSize(width: number, height: number, maxPixels: number): { width: number; height: number } {
+  const scale = Math.min(1, Math.sqrt(maxPixels / (width * height)));
+  if (scale === 1) return { width, height };
+  if (width >= height) {
+    let w = Math.max(1, Math.floor(width * scale)), h = Math.max(1, Math.round(w * height / width));
+    while (w * h > maxPixels && w > 1) { w -= 1; h = Math.max(1, Math.round(w * height / width)); }
+    return { width: w, height: h };
+  }
+  let h = Math.max(1, Math.floor(height * scale)), w = Math.max(1, Math.round(h * width / height));
+  while (w * h > maxPixels && h > 1) { h -= 1; w = Math.max(1, Math.round(h * width / height)); }
+  return { width: w, height: h };
 }
 /** Selector metadata stays valid in memory this long; afterwards it is served while refreshing. */
 export const CATALOG_TTL_MS = 10 * 60_000;
@@ -20,6 +45,8 @@ export interface RequestObserver {
   beforeRequest?: (kind: 'models' | 'inference', signal: AbortSignal) => Promise<void>;
   afterRequest?: (kind: 'models' | 'inference') => void;
   onUsageLimit?: () => Promise<void>;
+  /** Shared stop state; a newer `generation` means a human (re)start in any process. */
+  usageState?: () => Promise<{ stopped: boolean; generation: number }>;
 }
 
 /** Sanitized native provider labels supplement dsh's stable routing classification. */
@@ -43,6 +70,8 @@ export class SiwcLlmError extends LlmError {
 }
 
 const usageLimit = (error: BridgeError) => ['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable'].includes(error.code);
+/** A stop this process already recorded; reported like a quota stop but never recorded again. */
+const LOCAL_STOP = 'USAGE_LIMIT_STOPPED';
 function responseContext(error: unknown, response?: Response): unknown {
   if (!(error instanceof BridgeError) || !response || error.status !== undefined) return error;
   const requestId = error.requestId ?? providerFailure({}, response.status, response.headers.get('x-request-id')).requestId;
@@ -54,8 +83,10 @@ function classified(error: unknown, signal?: AbortSignal): LlmError {
   if (signal?.aborted && signal.reason instanceof DOMException && signal.reason.name === 'TimeoutError') return new SiwcLlmError(new BridgeError('TIMEOUT', 'SIWC要求が制限時間内に完了しませんでした。'), 'TIMEOUT');
   if (signal?.aborted || (error instanceof BridgeError && ['CANCELLED', 'cancelled'].includes(error.code))) return new SiwcLlmError(new BridgeError('CANCELLED', 'SIWC要求を中断しました。'), 'ABORTED');
   if (error instanceof SiwcLlmError) return error;
+  // DSH's own image-offload request carries its retry instruction; pass it through unchanged.
+  if (error instanceof LlmError && error.code === IMAGE_OFFLOAD_REQUIRED_CODE) return error;
   if (!(error instanceof BridgeError)) return new SiwcLlmError(new BridgeError('TRANSPORT', 'SIWC通信または応答処理に失敗しました。要求の自動再実行はしません。'), 'TRANSPORT');
-  const code = usageLimit(error) ? 'QUOTA'
+  const code = usageLimit(error) || error.code === LOCAL_STOP ? 'QUOTA'
     : error.code === 'insufficient_quota' ? 'ACCOUNT_QUOTA'
     : error.code === 'UNSUPPORTED_CONTENT' || error.code === 'UNSUPPORTED_TOOL' || error.code === 'UNSUPPORTED_OPTION' ? 'UNSUPPORTED_OPTION'
     : error.status === 401 ? 'AUTH'
@@ -67,7 +98,8 @@ function classified(error: unknown, signal?: AbortSignal): LlmError {
 }
 
 export class SiwcAdapter extends LlmAdapter {
-  private limitReached = false;
+  /** Shared start generation seen when this process stopped; Infinity if it could not be read. */
+  private limitedAt?: number;
   private readonly requests = new Set<AbortController>();
   private catalog?: { provider: string; registrationId: string; expiresAt: number; models: readonly LlmModelInfo[] };
   private catalogGeneration = 0;
@@ -79,15 +111,27 @@ export class SiwcAdapter extends LlmAdapter {
   override providerRetryPolicy(_provider: string): ResolvedRetryPolicy {
     return { mode: 'normal', maxRetries: 0, retryableCodes: ['TRANSPORT', 'SERVER'], initialDelayMs: 500, maxDelayMs: 1000, jitterRatio: 0 };
   }
-  resetUsageLimit(): void { this.limitReached = false; }
-  isUsageLimited(): boolean { return this.limitReached; }
+  resetUsageLimit(): void { this.limitedAt = undefined; }
+  isUsageLimited(): boolean { return this.limitedAt !== undefined; }
+  /** Current stop after picking up a human start recorded by any process. */
+  async usageLimited(): Promise<boolean> { try { await this.checkUsageStop(); return false; } catch { return true; } }
   cancelRequests(): void { this.discardCatalog(); for (const controller of this.requests) controller.abort(); }
   private discardCatalog(): void { this.catalog = undefined; this.catalogGeneration++; }
   private async stopForUsage(error: unknown): Promise<void> {
     if (error instanceof BridgeError && usageLimit(error)) {
-      this.limitReached = true;
+      this.limitedAt = Number.POSITIVE_INFINITY;
       await this.observer.onUsageLimit?.();
+      // Only a start recorded after this point may lift the stop in this process.
+      const state = await this.observer.usageState?.().catch(() => undefined);
+      if (state && Number.isSafeInteger(state.generation)) this.limitedAt = state.generation;
     }
+  }
+  /** Refuse while stopped, unless any process (DSH screen or CLI) has recorded a newer human start. */
+  private async checkUsageStop(): Promise<void> {
+    if (this.limitedAt === undefined) return;
+    const state = await this.observer.usageState?.().catch(() => undefined);
+    if (state && !state.stopped && Number.isSafeInteger(state.generation) && state.generation > this.limitedAt) { this.limitedAt = undefined; return; }
+    throw new BridgeError(LOCAL_STOP, 'ChatGPTプラン利用が停止中です。公式Usageを確認してから /siwc resume confirmed で再開してください。');
   }
 
   private async identity(signal: AbortSignal): Promise<string | undefined> {
@@ -103,7 +147,7 @@ export class SiwcAdapter extends LlmAdapter {
       // Production auth supplies the ID bound to this token while holding its store lock.
       if (expectedIdentity !== undefined && expectedIdentity !== registrationId) throw new BridgeError('INVALID_REPLAY_CONTEXT', '送信時の登録と会話履歴が一致しないか、登録を確認できません。新しい会話を開始してください。');
       tokenIdentity?.(registrationId);
-      if (kind === 'inference' && this.limitReached) throw new BridgeError('subscription_sharing_usage_limit_exceeded', 'ChatGPTプラン利用の停止を解除してから再実行してください。');
+      if (kind === 'inference') await this.checkUsageStop();
       const headers = new Headers(attributionHeaders());
       // Attribution can never replace the bearer or add a tenant/billing path.
       headers.delete('openai-organization'); headers.delete('openai-project');
@@ -155,7 +199,7 @@ export class SiwcAdapter extends LlmAdapter {
       catch (error) { throw classified(error, callerSignal); }
       const stored = registrationId ? await this.options.catalogStore.load(registrationId).catch(() => undefined) : undefined;
       if (registrationId && stored?.length && generation === this.catalogGeneration) {
-        const models: LlmModelInfo[] = stored.map(model => ({ provider, id: model.id, name: model.name, inputModalities: ['text'] }));
+        const models: LlmModelInfo[] = stored.map(model => ({ provider, id: model.id, name: model.name, inputModalities: [...INPUT_MODALITIES] }));
         this.catalog = { provider, registrationId, expiresAt: Date.now() + CATALOG_TTL_MS, models: structuredClone(models) };
         this.refreshInBackground(provider);
         return models;
@@ -196,7 +240,7 @@ export class SiwcAdapter extends LlmAdapter {
         if (!object(raw) || raw.visibility !== 'list') continue;
         if (typeof raw.slug !== 'string' || !raw.slug.trim() || raw.slug.length > 200 || typeof raw.display_name !== 'string'
           || !raw.display_name.trim() || raw.display_name.length > 200 || slugs.has(raw.slug)) throw new BridgeError('INVALID_MODEL_CATALOG', '表示対象モデルのslugまたは表示名が不正です。');
-        slugs.add(raw.slug); models.push({ provider, id: raw.slug, name: raw.display_name, inputModalities: ['text'] });
+        slugs.add(raw.slug); models.push({ provider, id: raw.slug, name: raw.display_name, inputModalities: [...INPUT_MODALITIES] });
       }
       if (this.credentials.status && registrationId && generation === this.catalogGeneration) {
         this.catalog = { provider, registrationId, expiresAt: Date.now() + CATALOG_TTL_MS, models: structuredClone(models) };
@@ -220,6 +264,34 @@ export class SiwcAdapter extends LlmAdapter {
     return { ...selected, systemPromptUpdate: 'in-history', ...(reasoning ? { reasoning } : {}) };
   }
 
+  /**
+   * Read request versions of attached images through DSH's attachment service.
+   * Offloaded images become DSH's placeholder text; when the request would carry
+   * too many image bytes, DSH is asked to offload the oldest ones and retry.
+   */
+  private async prepareMedia(options: GenerateOptions, signal: AbortSignal): Promise<{ options: GenerateOptions; media?: RequestMedia }> {
+    if (!options.messages.some(message => contentHasImage(message.content))) return { options };
+    const attachments = this.options.attachments?.();
+    if (!attachments) throw new BridgeError('UNSUPPORTED_CONTENT', '画像を読み込めませんでした。DSHの添付機能が有効か確認してください。');
+    const access = (ref: ImageAttachmentRef) => this.options.imageAccess?.(attachments, ref);
+    const messages = projectOffloadedImages(options.messages, ref => offloadedImageText(ref, access(ref)));
+    const refs = new Map<string, ImageAttachmentRef>();
+    for (const message of messages) for (const block of message.content) if (block.type === 'image') refs.set(block.attachment.attachmentId, block.attachment);
+    const images = new Map<string, RequestImage & { bytes: number }>();
+    for (const ref of refs.values()) {
+      signal.throwIfAborted();
+      const size = requestImageSize(ref.width, ref.height, IMAGE_POLICY.maxPixels);
+      const version = await attachments.readImageRequest(ref, { ...size, maxBytes: IMAGE_POLICY.maxBytes }, signal);
+      images.set(ref.attachmentId, { data: version.data, mediaType: version.mediaType, width: version.width, height: version.height, bytes: version.bytes });
+    }
+    const offloadImages = requiredImageOffload(messages, { representation: 'base64', maxBytes: IMAGE_POLICY.maxRequestBase64 }, block => images.get(block.attachment.attachmentId)?.bytes ?? 0);
+    if (offloadImages > 0) throw new LlmError(`添付画像の合計が大きすぎるため、古い画像${offloadImages}枚をテキスト参照に置き換えて再実行します。`, IMAGE_OFFLOAD_REQUIRED_CODE, { offloadImages });
+    return {
+      options: messages === options.messages ? options : { ...options, messages: [...messages] },
+      media: { images, handle: (ref, version) => requestImageHandleText(ref, version, access(ref)) },
+    };
+  }
+
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const controller = new AbortController(); this.requests.add(controller);
     const signals = [controller.signal, AbortSignal.timeout(180_000)]; if (options.signal) signals.push(options.signal);
@@ -233,8 +305,9 @@ export class SiwcAdapter extends LlmAdapter {
       if (identity === undefined && options.messages.some(message => message.role === 'assistant' && message.source.replayState !== undefined)) {
         throw new BridgeError('INVALID_REPLAY_CONTEXT', '内部履歴の元登録を確認できません。登録情報を提供する認証元で新しい会話を開始してください。');
       }
-      const body = buildRequest(options, identity);
-      if (this.limitReached) throw new BridgeError('subscription_sharing_usage_limit_exceeded', 'ChatGPTプラン利用が停止中です。公式Usage画面を確認してください。');
+      const prepared = await this.prepareMedia(options, signal);
+      const body = buildRequest(prepared.options, identity, prepared.media);
+      await this.checkUsageStop();
       // No catalog GET here: the catalog is not an entitlement check, and a completed
       // inference is what verifies model access. An unavailable model fails at the service.
       await scope?.check?.();

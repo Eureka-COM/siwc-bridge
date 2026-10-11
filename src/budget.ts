@@ -7,6 +7,8 @@ import { withWindowsFileLock } from './store.js';
 
 export interface BudgetStatus {
   version: 1; enabled: boolean; auth: number; models: number; inference: number; allowedThrough: number;
+  /** Increases on every explicit human start, so other processes can tell a new start from an old one. */
+  generation?: number;
 }
 export interface BeginOptions { maxRequests: number; creditSettingsConfirmed: boolean; }
 export type RequestKind = 'auth' | 'models' | 'inference';
@@ -15,7 +17,8 @@ async function load(file: string): Promise<BudgetStatus> {
   try {
     const state = JSON.parse(await readFile(file, 'utf8')) as BudgetStatus;
     if (state?.version !== 1 || typeof state.enabled !== 'boolean'
-      || [state.auth, state.models, state.inference, state.allowedThrough].some(n => !Number.isSafeInteger(n) || n < 0)) throw new Error();
+      || [state.auth, state.models, state.inference, state.allowedThrough].some(n => !Number.isSafeInteger(n) || n < 0)
+      || (state.generation !== undefined && (!Number.isSafeInteger(state.generation) || state.generation < 0))) throw new Error();
     return state;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1, enabled: false, auth: 0, models: 0, inference: 0, allowedThrough: 0 };
@@ -51,7 +54,7 @@ class BudgetCore {
     if (!Number.isSafeInteger(options.maxRequests) || options.maxRequests < 1 || options.maxRequests > 1000) throw new BridgeError('INVALID_BUDGET', '本人が開始する要求数は1〜1000の整数で指定してください。');
     return transaction(this.file, state => {
       if (!Number.isSafeInteger(state.inference + options.maxRequests)) throw new BridgeError('INVALID_BUDGET', '要求記録の上限に達しました。');
-      state.allowedThrough = state.inference + options.maxRequests; state.enabled = true; return { ...state };
+      state.allowedThrough = state.inference + options.maxRequests; state.enabled = true; state.generation = (state.generation ?? 0) + 1; return { ...state };
     });
   }
   async stop(): Promise<void> { await transaction(this.file, state => { state.enabled = false; }); }

@@ -1,6 +1,6 @@
 {
   "name": "siwc-bridge",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Independent Windows SIWC client for local Node.js harnesses",
   "type": "module",
   "license": "MIT",

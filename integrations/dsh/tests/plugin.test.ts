@@ -6,21 +6,27 @@ import { join } from 'node:path';
 import { apply } from '../lib/index.js';
 import { testLedger } from '../lib/ledger.js';
 
-test('Agentを通らない公開llm/stream入口でも添付をtext投影前に拒否する', async () => {
+test('公開llm/stream入口は画像・ファイル添付を通し、未知の内容だけを送信前に拒否する', async () => {
   const events = new Map<string, Function>(); let called = 0;
-  const context = { llm: { registerAdapter() {} }, effect() {}, on(name: string, callback: Function) { events.set(name, callback); }, inject() {} };
+  const context = { llm: { registerAdapter() { return { replace() {} }; } }, effect() {}, on(name: string, callback: Function) { events.set(name, callback); }, inject() {} };
   apply(context as never);
+  // Attachments are no longer refused at the Agent boundary.
+  assert.equal(events.has('agent/pre-step'), false); assert.equal(events.has('agent/request'), false);
   const middleware = events.get('llm/stream'); assert.ok(middleware);
   const next = async function* () { called++; yield { type: 'finish', reason: { kind: 'stop' } }; };
-  for (const type of ['image', 'file', 'audio', 'unknown']) {
+  for (const type of ['audio', 'unknown']) {
     const iterable = middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'user', content: [{ type }] }] }, next);
     await assert.rejects(async () => { for await (const _ of iterable) {} }, { code: 'UNSUPPORTED_CONTENT' });
   }
   assert.equal(called, 0);
-  for await (const _ of middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'user', content: [{ type: 'text', text: 'fixture' }] }] }, next)) {}
-  assert.equal(called, 1);
-  for await (const _ of middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'developer', content: [{ type: 'tool-addition', tools: [] }, { type: 'tool-removal', names: [] }] }] }, next)) {}
+  for (const type of ['image', 'file']) {
+    for await (const _ of middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'user', content: [{ type: 'text', text: 'see attached' }, { type }] }] }, next)) {}
+  }
   assert.equal(called, 2);
+  for await (const _ of middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'user', content: [{ type: 'text', text: 'fixture' }] }] }, next)) {}
+  assert.equal(called, 3);
+  for await (const _ of middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'developer', content: [{ type: 'tool-addition', tools: [] }, { type: 'tool-removal', names: [] }] }] }, next)) {}
+  assert.equal(called, 4);
 });
 
 test('slash resume requires explicit settings confirmation and preserves the stopped verification budget', async () => {

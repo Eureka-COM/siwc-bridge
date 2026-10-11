@@ -1,6 +1,6 @@
 {
   "name": "dsh-siwc-bridge",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Personal Windows dsh adapter using OpenAI's public SIWC protocol",
   "type": "module",
   "license": "MIT",
@@ -11,9 +11,10 @@
   "engines": { "node": ">=24.0.0" },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test --test-concurrency=1 tests/*.test.ts",
+    "sync-core": "node scripts/sync-core.mjs",
+    "build": "node scripts/sync-core.mjs && tsc -p tsconfig.json",
+    "typecheck": "node scripts/sync-core.mjs && tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/sync-core.mjs && node --test --test-concurrency=1 tests/*.test.ts",
     "setup": "node scripts/setup.mjs",
     "start": "node scripts/start.mjs",
     "live-test": "node scripts/live-test.mjs",

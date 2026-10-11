@@ -5,7 +5,9 @@ import { BridgeError } from './errors.js';
 import { withWindowsFileLock } from './store.js';
 
 export type RequestKind = 'auth' | 'models' | 'inference';
-interface Ledger { version: 1; armed: boolean; personalUse: boolean; auth: number; models: number; inference: number; limit: 6; updatedAt: string; stoppedFrom?: 'verification' | 'personal'; }
+interface Ledger { version: 1; armed: boolean; personalUse: boolean; auth: number; models: number; inference: number; limit: 6; updatedAt: string; stoppedFrom?: 'verification' | 'personal';
+  /** Increases on every explicit human (re)start, so a running process can tell a new start from the one it stopped. */
+  generation?: number; }
 function location(): string {
   const local = process.env.LOCALAPPDATA;
   if (!local || !isAbsolute(local) || local.startsWith('\\\\')) throw new BridgeError('LOCAL_STATE_UNAVAILABLE', 'Windowsのローカル検証記録領域がありません。');
@@ -20,6 +22,7 @@ async function load(file: string): Promise<Ledger> {
     if (row.personalUse === undefined) row.personalUse = false;
     if (typeof row.personalUse !== 'boolean' || (row.personalUse && row.armed)) throw new Error();
     if (row.stoppedFrom !== undefined && (!['verification', 'personal'].includes(row.stoppedFrom) || row.armed || row.personalUse)) throw new Error();
+    if (row.generation !== undefined && (!Number.isSafeInteger(row.generation) || row.generation < 0)) throw new Error();
     return row;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1, armed: false, personalUse: false, auth: 0, models: 0, inference: 0, limit: 6, updatedAt: new Date().toISOString() };
@@ -55,7 +58,7 @@ export async function recordRequest(kind: RequestKind, signal?: AbortSignal): Pr
 }
 function countRequest(row: Ledger, kind: RequestKind): void {
   if (kind === 'inference' && !row.armed && !row.personalUse) throw new BridgeError('LIVE_NOT_STARTED', row.stoppedFrom
-    ? '利用上限のエラーで推論を停止しています。公式Usageを確認してから node lib/cli.js resume で再開してください。'
+    ? '利用上限のエラーで推論を停止しています。公式Usageを確認してから、DSH画面で /siwc resume confirmed（またはターミナルで node lib/cli.js resume）を実行して再開してください。'
     : 'ChatGPTプランの利用はまだ開始していません。初回確認（DSH画面では /siwc confirm、またはターミナルで node lib/cli.js confirm）で開始してください。');
   if (kind === 'inference' && row.armed && row.inference >= row.limit) throw new BridgeError('LIVE_BUDGET_EXHAUSTED', 'ライブ検証の6要求を使いました。自動再試行や別プロセスで続けません。');
   row[kind]++;
@@ -64,7 +67,11 @@ export async function armVerification(): Promise<Ledger> {
   return transaction(async row => { arm(row); return { ...row }; });
 }
 export async function verificationStatus(): Promise<Ledger> { return load(location()); }
-function arm(row: Ledger): void { row.armed = true; row.personalUse = false; delete row.stoppedFrom; }
+/** Shared stop state for every running process: stopped, and the generation of the last human start. */
+export async function usageState(): Promise<{ stopped: boolean; generation: number }> { return stateOf(await load(location())); }
+function stateOf(row: Ledger): { stopped: boolean; generation: number } { return { stopped: !row.armed && !row.personalUse, generation: row.generation ?? 0 }; }
+const started = (row: Ledger): void => { row.generation = (row.generation ?? 0) + 1; };
+function arm(row: Ledger): void { row.armed = true; row.personalUse = false; delete row.stoppedFrom; started(row); }
 function stop(row: Ledger): void {
   if (row.personalUse) row.stoppedFrom = 'personal';
   else if (row.armed) row.stoppedFrom = 'verification';
@@ -79,6 +86,7 @@ function resume(row: Ledger, options: { settingsConfirmed: boolean }): void {
   row.armed = row.stoppedFrom === 'verification';
   row.personalUse = row.stoppedFrom === 'personal';
   delete row.stoppedFrom;
+  started(row);
 }
 /** Human-confirmed recovery restores only the previously authorized mode, never resets counts. */
 export async function resumeInference(options: { settingsConfirmed: boolean }): Promise<void> { await transaction(async row => resume(row, options)); }
@@ -90,6 +98,7 @@ function start(row: Ledger): StartResult {
   if (row.stoppedFrom) return 'stopped';
   if (row.armed) return 'verification';
   row.personalUse = true;
+  started(row);
   return 'started';
 }
 export async function startPersonalUse(): Promise<StartResult> { return transaction(async row => start(row)); }
@@ -97,6 +106,7 @@ export async function startPersonalUse(): Promise<StartResult> { return transact
 function finish(row: Ledger): void {
   if (!row.armed && row.stoppedFrom !== 'verification') throw new BridgeError('LIVE_NOT_STARTED', '明示開始していない検証を終了できません。');
   row.armed = false; row.personalUse = true; delete row.stoppedFrom;
+  started(row);
 }
 export async function finishVerification(): Promise<void> { await transaction(async row => finish(row)); }
 /** Pure fixture ledger cannot read credentials; no production path override is exposed. */
@@ -109,5 +119,6 @@ export function testLedger(file: string) {
     resume: (options: { settingsConfirmed: boolean }) => transaction(async row => resume(row, options), undefined, file),
     start: () => transaction(async row => start(row), undefined, file),
     status: () => load(file),
+    usageState: async () => stateOf(await load(file)),
   };
 }

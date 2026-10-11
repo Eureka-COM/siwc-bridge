@@ -8,7 +8,7 @@ export type { AuthStatus, LoginOptions } from './auth.js';
 export { RequestBudget } from './budget.js';
 export type { BeginOptions, BudgetStatus } from './budget.js';
 export { SiwcClient } from './client.js';
-export type { CredentialSource, RequestObserver, ReplayOptions } from './client.js';
+export type { CredentialSource, RequestObserver, ReplayOptions, UsageState } from './client.js';
 export type { AppIdentity } from './app.js';
 export type { InputMessage, OutputMessage, ReasoningItem, FunctionCallItem, FunctionCallOutputItem,
   ResponseInputItem, ResponseOutputItem, FunctionTool, NamespaceTool, ResponseRequest, ModelInfo,
@@ -26,6 +26,7 @@ export function createWindowsClient(options: AppIdentity) {
   const client = new SiwcClient(auth, {
     beforeRequest: (kind, signal) => budget.request(kind, signal),
     onUsageLimit: () => budget.stop(),
+    usageState: async () => { const state = await budget.status(); return { stopped: !state.enabled, generation: state.generation ?? 0 }; },
   });
   return {
     auth, client, budget,
