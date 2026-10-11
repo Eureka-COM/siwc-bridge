@@ -43,7 +43,7 @@ async function turn(name, task, { model, effort, sessionId, timeoutMs = 300_000 
     name, exitCode: result.code, timedOut: result.timedOut, seconds: Math.round((Date.now() - started) / 100) / 10, session,
     turnEnd: end?.kind, failure: end?.failure ? `${end.failure.code}: ${String(end.failure.message).slice(0, 300)}` : undefined,
     tools: rows.filter(row => row.type === 'tool_call').map(row => row.tool), toolErrors: rows.filter(row => row.type === 'tool_result' && row.status === 'error').length,
-    thinking: rows.some(row => row.type === 'thinking'), final: final.slice(0, 200),
+    thinking: rows.some(row => row.type === 'thinking'), final,
     stderr: result.code ? result.stderr.split(/\r?\n/).filter(Boolean).slice(-4) : undefined,
   };
 }
@@ -65,7 +65,7 @@ const otherModel = catalog?.find(entry => entry.id !== model)?.id;
 const selected = new Set(process.argv.slice(2));
 const want = name => selected.size === 0 || selected.has(name);
 const results = [];
-const check = (result, ok, detail) => { result.pass = ok; if (detail) result.detail = detail; results.push(result); console.log(JSON.stringify(result)); };
+const check = (result, ok, detail) => { result.pass = ok; if (detail) result.detail = detail; results.push(result); console.log(JSON.stringify({ ...result, final: result.final.slice(-200) })); };
 
 await install();
 if (want('text')) { const r = await turn('text', '日本語で「動作確認OK」とだけ返してください。', { model }); check(r, r.exitCode === 0 && r.final.includes('動作確認OK')); }

@@ -265,9 +265,10 @@ export class SiwcAdapter extends LlmAdapter {
       if (scope) signal = AbortSignal.any([signal, scope.signal]);
       const prepared = await this.prepareMedia(options, signal, notes);
       touch();
-      response = await this.request('inference', signal, id => buildRequest(prepared.options, { registrationId: id, media: prepared.media, notes }), id => { registrationId = id; });
+      const toolNames = new Map<string, string>();
+      response = await this.request('inference', signal, id => buildRequest(prepared.options, { registrationId: id, media: prepared.media, notes, toolNames }), id => { registrationId = id; });
       touch();
-      const stream = new ResponseStream(options.model, notes, registrationId);
+      const stream = new ResponseStream(options.model, notes, registrationId, toolNames);
       for await (const event of readSse(response.body ?? new ReadableStream(), signal, notes)) {
         touch();
         for (const chunk of stream.accept(event)) yield chunk;

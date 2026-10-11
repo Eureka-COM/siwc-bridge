@@ -92,7 +92,7 @@ export class SiwcClient {
       }
       if (kind === 'inference') await this.checkUsageStop(combined);
       const headers = new Headers({ authorization: `Bearer ${token}`, accept: kind === 'models' ? 'application/json' : 'text/event-stream',
-        'user-agent': 'siwc-bridge/0.2.2 (https://github.com/Eureka-COM/siwc-bridge)' });
+        'user-agent': 'siwc-bridge/0.3.0 (https://github.com/Eureka-COM/siwc-bridge)' });
       if (body) headers.set('content-type', 'application/json');
       await this.observer.beforeRequest(kind, combined);
       combined.throwIfAborted();

@@ -1,5 +1,6 @@
 import type { GenerateOptions, RequestMessage, StreamChunk, TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm';
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
+import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { BridgeError } from './errors.js';
 import { reasoningRequest } from './reasoning.js';
@@ -73,7 +74,22 @@ export interface RequestMedia {
 }
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
-export interface BuildContext { registrationId?: string; media?: RequestMedia; notes?: Notes }
+export interface BuildContext {
+  registrationId?: string; media?: RequestMedia; notes?: Notes;
+  /** Filled by buildRequest: function name sent to the service → DSH tool name. */
+  toolNames?: Map<string, string>;
+}
+
+/**
+ * Responses function names allow only letters, digits, "_" and "-" (at most 64).
+ * A DSH tool whose name falls outside that (an MCP tool with "." or a long name)
+ * is sent under a stable safe alias and mapped back when the model calls it.
+ */
+export function wireToolName(name: string): string {
+  if (/^[A-Za-z0-9_-]{1,64}$/.test(name)) return name;
+  const base = name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 55) || 'tool';
+  return `${base}_${createHash('sha256').update(name).digest('hex').slice(0, 8)}`;
+}
 
 /** User and tool content: text, plus images as native input parts. */
 function content(message: RequestMessage, context: BuildContext): string | Record<string, unknown>[] {
@@ -180,7 +196,7 @@ export function buildRequest(options: GenerateOptions, context: BuildContext = {
       }
       for (const block of message.content) {
         if (block.type === 'text') { if (block.text !== '') input.push({ role: 'assistant', content: block.text }); }
-        else if (block.type === 'tool-call') addCall(block.id, block.name, block.arguments);
+        else if (block.type === 'tool-call') addCall(block.id, wireToolName(block.name), block.arguments);
         else if (block.type !== 'reasoning') context.notes?.add(`request.skipped_block.${label(block.type, 40) ?? 'unknown'}`);
       }
       continue;
@@ -202,9 +218,11 @@ export function buildRequest(options: GenerateOptions, context: BuildContext = {
   if (options.tools?.length) {
     const names = new Set<string>();
     const tools = options.tools.flatMap(tool => {
-      if (names.has(tool.name)) { context.notes?.add('request.duplicate_tool_skipped'); return []; }
-      names.add(tool.name);
-      return [{ type: 'function', name: tool.name, description: tool.description ?? '', parameters: object(tool.parameters) ? tool.parameters : { type: 'object', properties: {} }, strict: false }];
+      const wire = wireToolName(tool.name);
+      if (names.has(wire)) { context.notes?.add('request.duplicate_tool_skipped'); return []; }
+      names.add(wire);
+      if (wire !== tool.name) { context.toolNames?.set(wire, tool.name); context.notes?.add('request.tool_name_aliased'); }
+      return [{ type: 'function', name: wire, description: tool.description ?? '', parameters: object(tool.parameters) ? tool.parameters : { type: 'object', properties: {} }, strict: false }];
     });
     body.tools = [{ type: 'namespace', name: TOOL_NAMESPACE, description: 'Tools executed by the local DeepSeek Harness with its own approval policy.', tools }];
   }
@@ -295,7 +313,8 @@ export class ResponseStream {
   private readonly summaries = new Map<string, Block>();
   private nextIndex = 0;
   completed = false;
-  constructor(private readonly model: string, private readonly notes = new Notes(), private readonly registrationId?: string) {}
+  constructor(private readonly model: string, private readonly notes = new Notes(), private readonly registrationId?: string,
+    private readonly toolNames: ReadonlyMap<string, string> = new Map()) {}
 
   private append(map: Map<string, Block>, key: string, kind: 'text' | 'reasoning', delta: string): StreamChunk[] {
     const chunks: StreamChunk[] = [];
@@ -398,7 +417,7 @@ export class ResponseStream {
         }
       } else if (item.type === 'function_call') {
         const id = text(item.call_id) && item.call_id !== '' ? item.call_id : undefined;
-        const name = text(item.name) && item.name !== '' ? item.name : undefined;
+        const name = text(item.name) && item.name !== '' ? this.toolNames.get(item.name) ?? item.name : undefined;
         if (!id || !name) { this.notes.add('stream.call_without_id_or_name'); continue; }
         if (seen.has(id)) { this.notes.add('stream.duplicate_call'); continue; }
         seen.add(id);

@@ -35,7 +35,7 @@ for (const file of files) {
 }
 const manifest = join(destination, 'source-manifest.json');
 if (!checkOnly) await writeFile(manifest, JSON.stringify(inventory, null, 2) + '\n');
-const zip = join(destination, 'dsh-siwc-bridge-0.2.2-source.zip');
+const zip = join(destination, 'dsh-siwc-bridge-0.3.0-source.zip');
 // .NET ZIP writer is the OS library; JSON file paths travel through an env field.
 if (!checkOnly) await promisify(execFile)(systemPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop"; Add-Type -AssemblyName System.IO.Compression; $rows=Get-Content -LiteralPath $env:DSH_SOURCE_MANIFEST -Encoding UTF8 | ConvertFrom-Json; $f=[IO.File]::Open($env:DSH_SOURCE_ZIP,[IO.FileMode]::Create); $z=New-Object IO.Compression.ZipArchive($f,[IO.Compression.ZipArchiveMode]::Create,$false); try { foreach($r in $rows) { $e=$z.CreateEntry($r.file,[IO.Compression.CompressionLevel]::Optimal); $e.LastWriteTime=[DateTimeOffset]::Parse("1980-01-01T00:00:00+00:00"); $s=$e.Open(); try { $b=[IO.File]::ReadAllBytes([IO.Path]::Combine($env:DSH_SOURCE_ROOT,$r.file)); $s.Write($b,0,$b.Length) } finally { $s.Dispose() } } } finally { $z.Dispose(); $f.Dispose() }'], { windowsHide: true, env: { ...process.env, DSH_SOURCE_MANIFEST: manifest, DSH_SOURCE_ZIP: zip, DSH_SOURCE_ROOT: paths.root } });
 const packed = await runNode(resolveNpmCli(), ['pack', '--ignore-scripts', '--json', ...(checkOnly ? ['--dry-run'] : []), '--pack-destination', destination], { cwd: paths.root, capture: true });

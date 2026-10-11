@@ -40,7 +40,7 @@ for (const file of files) {
 await mkdir(destination, { recursive: true });
 const manifest = join(destination, 'source-manifest.json');
 if (!checkOnly) await writeFile(manifest, JSON.stringify(inventory, null, 2) + '\n');
-const zip = join(destination, 'siwc-bridge-0.2.2-source.zip');
+const zip = join(destination, 'siwc-bridge-0.3.0-source.zip');
 if (!checkOnly) await promisify(execFile)(systemPowerShell(), ['-NoProfile', '-NonInteractive', '-Command',
   '$ErrorActionPreference="Stop"; Add-Type -AssemblyName System.IO.Compression; $rows=Get-Content -LiteralPath $env:SIWC_RELEASE_MANIFEST -Encoding UTF8 | ConvertFrom-Json; $f=[IO.File]::Open($env:SIWC_RELEASE_ZIP,[IO.FileMode]::Create); $z=New-Object IO.Compression.ZipArchive($f,[IO.Compression.ZipArchiveMode]::Create,$false); try { foreach($r in $rows) { $e=$z.CreateEntry($r.file,[IO.Compression.CompressionLevel]::Optimal); $e.LastWriteTime=[DateTimeOffset]::Parse("1980-01-01T00:00:00+00:00"); $s=$e.Open(); try { $b=[IO.File]::ReadAllBytes([IO.Path]::Combine($env:SIWC_RELEASE_ROOT,$r.file)); $s.Write($b,0,$b.Length) } finally { $s.Dispose() } } } finally { $z.Dispose(); $f.Dispose() }'],
   { windowsHide: true, env: { ...process.env, SIWC_RELEASE_MANIFEST: manifest, SIWC_RELEASE_ZIP: zip, SIWC_RELEASE_ROOT: root } });

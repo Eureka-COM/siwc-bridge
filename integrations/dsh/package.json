@@ -1,6 +1,6 @@
 {
   "name": "dsh-siwc-bridge",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Personal Windows dsh adapter using OpenAI's public SIWC protocol",
   "type": "module",
   "license": "MIT",
@@ -51,7 +51,8 @@
     "e2e": "node scripts/e2e.mjs",
     "remove:plugin": "node scripts/uninstall.mjs",
     "release:local": "node scripts/release.mjs",
-    "check:publication": "node scripts/release.mjs --check-only"
+    "check:publication": "node scripts/release.mjs --check-only",
+    "e2e:web": "node scripts/e2e-web.mjs"
   },
   "dependencies": {
     "jose": "6.2.12"

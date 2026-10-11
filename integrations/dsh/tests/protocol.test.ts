@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { BlockAssembler, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
-import { buildRequest, mapUsage, Notes, providerFailure, readSse, ResponseStream } from '../lib/protocol.js';
+import { buildRequest, mapUsage, Notes, providerFailure, readSse, ResponseStream, wireToolName } from '../lib/protocol.js';
 
 const model = 'gpt-6.1-sol';
 const user = (text: string) => ({ role: 'user' as const, content: [{ type: 'text' as const, text }] });
@@ -201,4 +201,25 @@ test('usage mapping is disjoint and tolerant; provider failures keep codes but n
   assert.equal(failure.code, 'subscription_sharing_unsupported_capability'); assert.equal(failure.param, 'tools[0]'); assert.equal(failure.requestId, 'req_fixture');
   assert.equal(JSON.stringify(failure).includes('SECRET_ECHO') || failure.message.includes('SECRET_ECHO'), false);
   assert.equal(providerFailure({ detail: 'Unsupported service_tier: fast' }, 400).code, 'provider_error');
+});
+
+test('tool names the service does not accept are sent under a stable alias and mapped back', () => {
+  const original = 'mcp.files/read text';
+  const alias = wireToolName(original);
+  assert.match(alias, /^[A-Za-z0-9_-]{1,64}$/);
+  assert.equal(wireToolName(original), alias);
+  assert.equal(wireToolName('read_file'), 'read_file');
+  const toolNames = new Map<string, string>();
+  const body = buildRequest({ provider: 'siwc', model: 'gpt-6.1-sol', tools: [{ name: original, description: 'd', parameters: { type: 'object', properties: {} } }, { name: 'read', description: 'r', parameters: { type: 'object', properties: {} } }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'go' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'call_1', name: original, arguments: '{}' }], source: { provider: 'siwc', model: 'gpt-6.1-sol' } },
+      { role: 'tool', toolCallId: 'call_1', content: [{ type: 'text', text: 'ok' }] }] } as never, { toolNames });
+  const tools = (body.tools as any[])[0].tools.map((tool: any) => tool.name);
+  assert.deepEqual(tools, [alias, 'read']);
+  assert.equal((body.input as any[]).find(item => item.type === 'function_call').name, alias);
+  assert.equal(toolNames.get(alias), original);
+  const stream = new ResponseStream('gpt-6.1-sol', undefined, undefined, toolNames);
+  stream.accept({ type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', call_id: 'call_2', name: alias, arguments: '{}' } });
+  const chunks = stream.accept({ type: 'response.completed', response: { status: 'completed', output: [] } });
+  assert.equal((chunks.find(chunk => chunk.type === 'block-end') as any).block.name, original);
 });

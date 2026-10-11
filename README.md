@@ -8,7 +8,7 @@ SDK本体は特定のハーネスに依存せず、認証・安全なローカ�
 
 ## 最短手順
 
-- **DSHで使いたい**：[DSH接続の最短手順](integrations/dsh/README.md#最短手順dshで使う)へ。clone、導入、ログイン、初回確認、モデル選択、`npm.cmd start` の順に進めます。**使い始める前に、課金の注意（App limits の設定）を必ず読んでください。**
+- **DSHで使いたい**：[DSH接続の最短手順](integrations/dsh/README.md#最短手順)へ。clone、`npm.cmd run setup`、ブラウザでのサインイン、`npm.cmd start` の4段階です。
 - **自分のNode.jsアプリに組み込みたい**：下の「Windowsでの準備」と「開発者向け：既存ループへの組み込み」へ。
 - **実モデルを呼ばずに動きだけ見たい**：clone後に `npm.cmd ci --ignore-scripts`、`npm.cmd run build`、`npm.cmd run example:mock`。
 
@@ -73,7 +73,7 @@ npm.cmd ci --ignore-scripts --no-audit --no-fund
 npm.cmd run build
 ```
 
-別の利用アプリへ導入する場合は、ここで`npm.cmd run release:local`を実行し、利用アプリのフォルダから`npm.cmd install --ignore-scripts <展開先>/artifacts/siwc-bridge-0.2.2.tgz`を実行します。`npm install siwc-bridge`によるレジストリ取得は提供していません。
+別の利用アプリへ導入する場合は、ここで`npm.cmd run release:local`を実行し、利用アプリのフォルダから`npm.cmd install --ignore-scripts <展開先>/artifacts/siwc-bridge-0.3.0.tgz`を実行します。`npm install siwc-bridge`によるレジストリ取得は提供していません。
 
 ## SDKの本人ログインと開始
 
@@ -201,9 +201,9 @@ npm.cmd run example:mock
 npm.cmd run release:local
 ```
 
-通常テストとモック例は架空資格情報・合成SSEを使い、実ログインや実モデル要求は行いません。v0.2.2（2026-10-11）では、Windows上でSDK 68件・DSH 96件のテストが成功しました（独立監査の再現テストを含みます）。2026-10-09の監査指摘修正時には、実DSHを使ったモックのローカルread往復も確認しています。GitHub ActionsでもWindowsの検証を実行します。合成応答での成功は、実アカウント接続や課金確認とは別です。
+通常テストとモック例は架空資格情報・合成SSEを使い、実ログインや実モデル要求は行いません。v0.3.0（2026-10-11）では、Windows上でSDK・DSH接続のテストがすべて成功し、DSH接続については本人のChatGPTプランで実際の通信による通しテスト（テキスト・ツール・複数ツール・サブエージェント・モデル切り替え・推論の度合い・画像/ファイル添付・中断）も成功しました。GitHub ActionsでもWindowsの検証を実行します。
 
-**SDKとDSH接続の実アカウント推論・公式Usageへの計上・請求は、このリポジトリの検証では確認していません。** 検証の範囲は[DSH接続の検証記録](integrations/dsh/docs/VERIFICATION.md)にまとめています。
+**公式Usageへの計上・請求額の確認は、このリポジトリの検証には含みません。** 検証の範囲は[DSH接続の検証記録](integrations/dsh/docs/VERIFICATION.md)にまとめています。
 
 SDKはテキストとローカルfunction tool向けです。SDKでの画像・音声・ファイル添付、hosted tools、backgroundなどは未対応です（DSH接続は画像・ファイルの添付に対応しています）。詳細な引数制約は[仕様照合](docs/COMPLIANCE.md)に記録しています。DSHのローカルreadはファイル添付とは別です。
 
