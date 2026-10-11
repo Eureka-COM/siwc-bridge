@@ -52,7 +52,7 @@ test('a search result carries the cited pages first (title and the sentence they
   assert.equal(result.truncated, false);
   const capped = collector.result(2);
   assert.equal(capped.sources.length, 2); assert.equal(capped.truncated, true);
-  assert.equal(cleanUrl('file:///etc/passwd'), undefined);
+  assert.equal(cleanUrl('ftp://example.org/archive'), undefined); assert.equal(cleanUrl('javascript:alert(1)'), undefined);
   assert.equal(cleanUrl('https://example.org/a?utm_source=openai&b=1'), 'https://example.org/a?b=1');
 });
 
