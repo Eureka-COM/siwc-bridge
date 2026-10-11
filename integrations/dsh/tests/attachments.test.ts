@@ -33,7 +33,7 @@ test('user images are sent as native input_image parts with DSH handle text; fil
   const { reads, service } = attachmentService();
   try {
     globalThis.fetch = async (url, init) => { if (url === 'https://api.openai.com/v1/responses') { inference++; body = JSON.parse(String(init?.body)); } return completedStream(); };
-    const adapter = new SiwcAdapter(credentials, {}, { attachments: () => service, imageAccess: () => ({ readonlyPath: 'C:/fixture/attachments/img-a.png' }) });
+    const adapter = new SiwcAdapter(credentials, {}, { attachments: () => service, imageAccess: () => ({ readonlyPath: '/fixture/attachments/img-a.png' }) });
     await run(adapter, { provider: 'siwc', model: 'fixture-model', messages: [{ role: 'user', content: [{ type: 'text', text: 'What colour is this?' }, { type: 'image', attachment: ref('img-a') }] }] } as GenerateOptions);
     assert.equal(inference, 1);
     // DSH's pixel budget is applied before reading the request version.
@@ -42,7 +42,7 @@ test('user images are sent as native input_image parts with DSH handle text; fil
     assert.ok(Array.isArray(user.content));
     assert.deepEqual(user.content[0], { type: 'input_text', text: 'What colour is this?' });
     assert.equal(user.content[1].type, 'input_text');
-    assert.match(user.content[1].text, /img-a|C:\/fixture\/attachments\/img-a\.png/);
+    assert.match(user.content[1].text, /img-a|\/fixture\/attachments\/img-a\.png/);
     assert.deepEqual(user.content[2], { type: 'input_image', image_url: `data:image/png;base64,${Buffer.from(PNG).toString('base64')}`, detail: 'auto' });
   } finally { globalThis.fetch = original; }
 });

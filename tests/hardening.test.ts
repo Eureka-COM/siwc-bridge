@@ -48,7 +48,8 @@ test('PowerShell is started only from the system folder, never by bare name', as
   assert.match(path, /^[A-Za-z]:\\.+\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe$/i);
   const previous = process.env.SystemRoot;
   try {
-    for (const value of ['Windows', '\\\\server\\share', '.\\fixture']) {
+    // Relative, UNC (two leading backslashes) and dot-relative values are refused.
+    for (const value of ['Windows', '\\'.repeat(2) + ['server', 'share'].join('\\'), '.\\fixture']) {
       process.env.SystemRoot = value;
       assert.throws(() => systemPowerShell(), { code: 'powershell_unavailable' });
     }
