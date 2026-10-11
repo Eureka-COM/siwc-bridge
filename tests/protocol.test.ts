@@ -145,3 +145,10 @@ test('usage and diagnostics preserve safe machine fields without service text or
     assert.equal(`${failure.message} ${JSON.stringify(failure)}`.includes(secret), false); return true;
   });
 });
+
+test('service notices outside the Responses namespace are skipped without completing a turn', () => {
+  const stream = new ResponseStream(model);
+  for (const type of ['codex.rate_limits', 'keepalive']) assert.deepEqual(stream.accept({ type, payload: { anything: true } }), []);
+  assert.throws(() => stream.end());
+  assert.throws(() => new ResponseStream(model).accept({ type: 'notice?token=FAKE_SECRET' }), (error: any) => error.code === 'UNSUPPORTED_STREAM_EVENT' && !error.message.includes('FAKE_SECRET'));
+});

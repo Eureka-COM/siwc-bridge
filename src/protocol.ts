@@ -18,8 +18,16 @@ function invalid(reason: string, event?: Record<string, unknown>): never {
     .filter(key => integer(event[key])).map(key => `;${key}=${event[key]}`).join('') : '';
   return fail('INVALID_STREAM', reason + position);
 }
+/**
+ * Events outside the Responses namespace (service notices such as rate-limit
+ * snapshots or keep-alives) carry no output item, text or tool call. They are
+ * skipped; a turn still succeeds only through response.completed. A type that
+ * is not a plain machine label is never treated as a notice.
+ */
+export const serviceNotice = (type: string): boolean => type !== 'error' && !type.startsWith('response.') && type.length <= 120 && /^[a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+)*$/.test(type);
+
 function unsupportedEvent(type: string): never {
-  const safeType = diagnostic(type, /^response\.[a-z0-9_]+(?:\.[a-z0-9_]+)*$/, 120) ?? 'redacted';
+  const safeType = diagnostic(type, /^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*$/, 120) ?? 'redacted';
   return fail('UNSUPPORTED_STREAM_EVENT', `event.type=${safeType}`);
 }
 export class ProviderFailure extends BridgeError {
@@ -215,6 +223,7 @@ export class ResponseStream {
       this.sequence = event.sequence_number;
     }
     if (event.type === 'response.failed' || event.type === 'error') throw providerFailure(event.type === 'response.failed' ? event.response : event);
+    if (serviceNotice(event.type)) return [];
     if (event.type === 'response.incomplete') fail('RESPONSE_INCOMPLETE', 'response.incomplete');
     if (event.type === 'response.output_item.added') {
       if (!integer(event.output_index) || !object(event.item) || !identifier(event.item.id)) invalid('output_item_added.schema_invalid', event);
@@ -297,7 +306,7 @@ export class ResponseStream {
       this.completed = true; events.push({ type: 'completed', response }); return events;
     } else if (!['response.created', 'response.in_progress', 'response.queued', 'response.content_part.added', 'response.content_part.done',
       'response.output_text.done', 'response.refusal.done', 'response.reasoning_summary_part.added', 'response.reasoning_summary_part.done',
-      'response.reasoning_summary_text.delta', 'response.reasoning_summary_text.done', 'response.reasoning_text.delta', 'response.reasoning_text.done'].includes(event.type)) unsupportedEvent(event.type);
+      'response.reasoning_summary_text.delta', 'response.reasoning_summary_text.done', 'response.reasoning_text.delta', 'response.reasoning_text.done', 'response.output_text.annotation.added'].includes(event.type)) unsupportedEvent(event.type);
     return [];
   }
   end(): void { if (!this.completed) fail('STREAM_INTERRUPTED', 'stream.response_completed_missing'); }

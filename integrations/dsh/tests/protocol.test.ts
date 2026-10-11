@@ -315,3 +315,22 @@ test('protocol failures identify only safe event types and schema locations, nev
     assert.equal(`${error.message} ${JSON.stringify(error)}`.includes(secret), false); return true;
   });
 });
+
+test('service notices outside the Responses namespace are skipped, while completion and unsafe names are still enforced', () => {
+  const stream = new ResponseStream(model);
+  for (const type of ['codex.rate_limits', 'keepalive', 'service.notice-v2']) assert.deepEqual(stream.accept({ type, payload: { anything: true } }), []);
+  assert.deepEqual(stream.accept({ type: 'response.output_text.annotation.added', output_index: 0 }), []);
+  // A notice never completes a turn on its own.
+  assert.throws(() => stream.end(), { code: 'STREAM_INTERRUPTED' });
+  // Not a plain label: still refused, and its name is not echoed.
+  assert.throws(() => new ResponseStream(model).accept({ type: 'notice?token=FAKE_SECRET' }), (error: any) => error.code === 'UNSUPPORTED_STREAM_EVENT' && !error.message.includes('FAKE_SECRET'));
+  // The bare error event still fails the turn.
+  assert.throws(() => new ResponseStream(model).accept({ type: 'error', code: 'server_error' }));
+  // A full turn with a notice in the middle completes normally.
+  const turn = new ResponseStream(model);
+  turn.accept(added(message())); turn.accept({ type: 'codex.rate_limits', primary: { used_percent: 10 } });
+  turn.accept({ type: 'response.output_text.delta', output_index: 0, item_id: 'msg_1', content_index: 0, delta: 'The file says hello.' });
+  turn.accept(done(message()));
+  const chunks = turn.accept(completed([message()]));
+  assert.equal(chunks.at(-1)?.type, 'finish');
+});
