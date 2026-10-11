@@ -26,7 +26,8 @@ export function cleanEnvironment(extra = {}, home = paths.home) {
       delete environment[name];
     }
   }
-  return { ...environment, ...extra, DSH_HOME: resolve(home), DSH_TELEMETRY_DISABLED: '1', DSH_PERMISSION_MODE: 'read-only' };
+  // Permission mode is DSH's own setting (chosen in its UI); tests pass one explicitly.
+  return { ...environment, ...extra, DSH_HOME: resolve(home), DSH_TELEMETRY_DISABLED: '1' };
 }
 
 export function resolveDshBin() {
@@ -110,25 +111,33 @@ export async function initializeProfile(name, template, { home = paths.home } = 
   if (result.code !== 0) throw new Error(`dsh profile ${name} の初期化に失敗しました: ${result.stderr.trim()}`);
 }
 
+// DeepSeek-account features need a DeepSeek sign-in this home never has; telemetry is
+// off, and titles come from the first prompt instead of an extra model request.
+// Everything else stays DSH's default.
 const disabledRows = ['session-title-llm', 'session-telemetry-otel', 'authorization', 'credentials', 'llm-deepseek', 'llm-deepseek-account', 'llm-pi-ai', 'deepseek-account'];
 const yaml = value => JSON.stringify(value);
 
-/** Generate a dsh overlay in the ignored local test environment. */
-export async function writeIsolationPatch(file, { provider = 'siwc', model, guard, fixture, webCredentials = false,
-  webCredentialsPath = 'dsh-siwc-bridge/web-credentials', printWebUrl = false } = {}) {
-  let content = disabledRows.filter(id => id !== 'credentials').map(id => `- id: ${id}\n  disabled: true\n`).join('\n');
-  // Web Connection receives a process-only signing key, separate from SIWC OAuth credentials.
-  content += '\n- id: credentials\n  disabled: true\n';
+/**
+ * The only overlay this integration applies to DSH: disable the DeepSeek-account
+ * pieces, keep Web sign-in keys in memory, use native tool calls (the ChatGPT-plan
+ * route has no programmatic tool calling), and pick the default model.
+ * `workspace`/`readOnly` are for automated tests only; normal use keeps DSH's own
+ * workspace and permission choices.
+ */
+export async function writeRuntimePatch(file, { provider = 'siwc', model, guard, fixture, webCredentials = false,
+  webCredentialsPath = 'dsh-siwc-bridge/web-credentials', printWebUrl = false, workspace, readOnly = false, effort } = {}) {
+  let content = disabledRows.map(id => `- id: ${id}\n  disabled: true\n`).join('\n');
   if (webCredentials) {
+    // Web Connection receives a process-only signing key, separate from SIWC OAuth credentials.
     content += `\n- insert:\n    - id: siwc-web-credentials\n      name: ${yaml(webCredentialsPath)}\n`;
     // A dsh patch replaces the whole config, so preserve its official CLI expressions.
     content += `\n- id: web-runtime\n  config:\n    openBrowser: !!js ctx.webStartup.openBrowser\n    printUrl: ${printWebUrl}\n`;
     content += '    publicUrl: !!js ctx.webStartup.publicUrl\n    surfaceContext: true\n    trustedHosts: !!js ctx.webStartup.trustedHosts\n';
   }
-  content += '\n- id: sandbox-policy\n  config:\n    mode: read-only\n    workspaceRoot: ' + yaml(paths.workspace) + '\n';
-  content += '\n- id: fs-sandbox\n  config:\n    cwd: ' + yaml(paths.workspace) + '\n';
+  if (workspace && readOnly) content += `\n- id: sandbox-policy\n  config:\n    mode: read-only\n    workspaceRoot: ${yaml(workspace)}\n`;
+  if (workspace) content += '\n- id: fs-sandbox\n  config:\n    cwd: ' + yaml(workspace) + '\n';
   content += '\n- id: tools\n  config:\n    mode: native\n';
-  if (model) content += `\n- id: agent-default-model\n  config:\n    provider: ${yaml(provider)}\n    model: ${yaml(model)}\n`;
+  if (model) content += `\n- id: agent-default-model\n  config:\n    provider: ${yaml(provider)}\n    model: ${yaml(model)}\n${effort ? `    reasoningEffort: ${yaml(effort)}\n` : ''}`;
   const inserted = [];
   if (guard) inserted.push({ id: 'siwc-test-guard', name: guard.path ?? paths.guardFixture, config: {
     dummyPath: guard.dummyPath, evidencePath: guard.evidencePath,
@@ -147,11 +156,19 @@ export async function writeIsolationPatch(file, { provider = 'siwc', model, guar
   }
   await mkdir(dirname(file), { recursive: true }); await writeFile(file, content, 'utf8');
 }
+/** v0.2 name, used by tests: the read-only dummy workspace is kept there explicitly. */
+export const writeIsolationPatch = (file, options = {}) => writeRuntimePatch(file, { workspace: paths.workspace, readOnly: true, ...options });
 
+/** Default model for a new start: the saved choice, else the first model of the saved account catalog, else none (choose in DSH). */
 export async function readSelectedModel(explicitModel) {
   if (explicitModel) return { model: explicitModel };
-  const [{ selectedModel }, { AuthManager }] = await Promise.all([import('../lib/admin.js'), import('../lib/auth.js')]);
-  const model = await selectedModel(new AuthManager());
-  if (!model) throw new Error('モデル未選択または登録が変わっています。node lib/cli.js models → node lib/cli.js model <slug> で選択してください。');
-  return { model };
+  try {
+    const [{ selectedModel }, { AuthManager }, { diskCatalogStore }] = await Promise.all([import('../lib/admin.js'), import('../lib/auth.js'), import('../lib/local-cache.js')]);
+    const auth = new AuthManager();
+    const saved = await selectedModel(auth);
+    if (saved) return { model: saved };
+    const active = (await auth.status()).activeId;
+    const catalog = active ? await diskCatalogStore().load(active) : undefined;
+    return { model: catalog?.[0]?.id };
+  } catch { return { model: undefined }; }
 }

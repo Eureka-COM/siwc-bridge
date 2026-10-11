@@ -17,7 +17,7 @@
     "test": "node scripts/sync-core.mjs && node --test --test-concurrency=1 tests/*.test.ts",
     "setup": "node scripts/setup.mjs",
     "start": "node scripts/start.mjs",
-    "live-test": "node scripts/live-test.mjs",
+    "e2e": "node scripts/e2e.mjs",
     "remove:plugin": "node scripts/uninstall.mjs",
     "release:local": "node scripts/release.mjs",
     "check:publication": "node scripts/release.mjs --check-only"

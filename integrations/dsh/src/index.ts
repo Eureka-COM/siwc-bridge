@@ -1,69 +1,77 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-commands';
-import { LlmError, resolveImageAttachmentAccess } from '@deepseek-ai/dsh-llm';
+import { resolveImageAttachmentAccess } from '@deepseek-ai/dsh-llm';
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
+import { createServices, signIn, saveModel, statusText, MANAGE_USAGE, PRIVACY_NOTICE } from './admin.js';
 import type { ImageSource } from './adapter.js';
-import { createServices, PRIVACY_NOTICE, MANAGE_USAGE, CREDIT_NOTICE, startMessage, saveModel, statusText } from './admin.js';
 import { safeFailure } from './errors.js';
-import { resumeInference, startPersonalUse } from './ledger.js';
 
 export const name = 'dsh-siwc-bridge';
 export const inject = ['llm'];
-/** Registers one provider, existing dsh slash commands, and input rejection. No tool executor. */
+
+const HELP = '/siwc [status] | login [登録ID] | models | model <slug> | select <登録ID> | sign-out | manage | resume | diagnostics';
+
+/** One provider ("ChatGPT plan (SIWC)") and one slash command. Everything else is DSH's own behaviour. */
 export function apply(ctx: Context): void {
-  const { auth, adapter } = createServices({
+  const service = <T>(name: string) => (ctx as unknown as { get(name: string): T | undefined }).get(name);
+  const { auth, adapter, diagnostics } = createServices({
     // Resolved per request: the attachment and filesystem services may start after this plugin.
-    attachments: () => (ctx as unknown as { get(name: string): ImageSource | undefined }).get('attachments'),
+    attachments: () => service<ImageSource>('attachments'),
     imageAccess: (attachments, ref) => resolveImageAttachmentAccess(attachments as AttachmentStore,
-      hostPath => (ctx as unknown as { get(name: string): { processPathFromHostPath(path: string): string | undefined } | undefined }).get('fs')?.processPathFromHostPath(hostPath), ref),
+      hostPath => service<{ processPathFromHostPath(path: string): string | undefined }>('fs')?.processPathFromHostPath(hostPath), ref),
   });
   const registration = ctx.llm.registerAdapter(['siwc'], adapter);
   // A background catalog refresh that changed the list re-notifies the selector.
-  adapter.onCatalogUpdated = () => registration.replace(['siwc']);
+  adapter.onCatalogUpdated = () => registration?.replace?.(['siwc']);
   ctx.effect(() => () => { adapter.cancelRequests(); auth.abortAll(); });
-  // Public LlmRuntime.stream can also be called without an Agent. Text, tool calls,
-  // tool changes and attachments (images natively, files as DSH's read-only path
-  // text) are supported; reject anything else before the host projects it.
-  ctx.on('llm/stream', async function* (options, next) {
-    if (options.provider === 'siwc' && options.messages.some(m => m.content.some(b => !['text', 'tool-call', 'reasoning', 'image', 'file'].includes(b.type)
-      && !((m.role === 'developer' || m.role === 'system') && (b.type === 'tool-addition' || b.type === 'tool-removal'))))) {
-      throw new LlmError('SIWCでは送信できない種類の内容が含まれています。', 'UNSUPPORTED_CONTENT');
-    }
-    yield* next();
-  });
   ctx.inject(['commands'], commandCtx => {
-    let privacyShown = false;
     commandCtx.commands.register({
-      name: 'siwc', description: 'ChatGPTプランの状態・公式ログイン・利用確認・モデル・Manage usage', recordInput: false,
-      input: { hint: 'status | login | continue | confirm | models | model <slug> | select <registration> | sign-out | manage | resume [confirmed]' },
+      name: 'siwc', description: 'ChatGPTプラン（Sign in with ChatGPT）の状態・サインイン・モデル一覧・利用状況', recordInput: false,
+      input: { hint: 'status | login | models | model <slug> | select <id> | sign-out | manage | resume | diagnostics' },
       handler: async ({ rawInput, signal }) => {
         const [action = 'status', value] = rawInput.trim().split(/\s+/);
         try {
-          if (action === 'login') { privacyShown = true; return { kind: 'success', text: PRIVACY_NOTICE + '\nContinue with ChatGPT: /siwc continue（新規登録）または /siwc continue <保存登録ID>（再認証）' }; }
-          if (action === 'continue') {
-            if (!privacyShown) return { kind: 'error', text: 'ログイン前の説明を /siwc login で表示してください。' };
-            adapter.cancelRequests();
-            await auth.login({ registrationId: value, signal });
-            return { kind: 'success', text: '認証結果を保存しました。登録を変更した場合は新しい会話を開始してください。初回のプラン利用確認: /siwc confirm\n' + await statusText(auth, adapter) };
+          switch (action) {
+            case '': case 'status':
+              return { kind: 'success', text: await statusText(auth, adapter, diagnostics) };
+            case 'login': case 'continue': {
+              adapter.cancelRequests();
+              const message = await signIn(auth, { registrationId: value, signal });
+              return { kind: 'success', text: `${PRIVACY_NOTICE}\n${message}` };
+            }
+            case 'confirm': case 'begin':
+              return { kind: 'success', text: '確認の手順は不要になりました（サインイン時に一度だけ案内します）。\n' + await statusText(auth, adapter, diagnostics) };
+            case 'models': {
+              const models = await adapter.listModelsFresh('siwc', signal);
+              return { kind: 'success', text: models.length ? models.map(m => `${m.id}: ${m.name}`).join('\n') : 'このアカウントで表示できるモデルがありません。' };
+            }
+            case 'model':
+              if (!value) return { kind: 'error', text: '使い方: /siwc model <slug>（/siwc models で一覧）' };
+              await saveModel(auth, value);
+              return { kind: 'success', text: `次回の起動時の既定モデルを ${value} にしました。今の会話は入力欄のモデル選択で切り替えられます。` };
+            case 'select':
+              if (!value) return { kind: 'error', text: '使い方: /siwc select <登録ID>（/siwc status で一覧）' };
+              adapter.cancelRequests(); await auth.select(value);
+              return { kind: 'success', text: '登録を切り替えました。新しい会話を始めてください。\n' + await statusText(auth, adapter, diagnostics) };
+            case 'sign-out': {
+              adapter.cancelRequests();
+              const result = await auth.signOut(signal);
+              return { kind: 'success', text: result.remoteRevocation === 'confirmed' ? 'サインアウトしました（トークンの失効も確認済み）。'
+                : `この端末のトークンを削除しました。サーバー側の失効は確認できなかったため、必要ならChatGPTの設定で接続を解除してください。${MANAGE_USAGE}` };
+            }
+            case 'manage':
+              return { kind: 'success', text: `Manage usage: ${MANAGE_USAGE}` };
+            case 'resume':
+              adapter.resume();
+              return { kind: 'success', text: `新しい要求を再開しました。上限が続いている場合は、同じ案内がまた表示されます。${MANAGE_USAGE}` };
+            case 'diagnostics': {
+              const lines = await diagnostics.tail(20);
+              return { kind: 'success', text: [`診断ログ（内容は含みません）: ${diagnostics.location}`, ...(lines.length ? lines : ['まだ記録はありません。'])].join('\n') };
+            }
+            default:
+              return { kind: 'error', text: `使い方: ${HELP}` };
           }
-          if (action === 'confirm') {
-            await auth.confirmPlan();
-            const started = await startPersonalUse();
-            return { kind: 'success', text: `You're using your ChatGPT plan. Got it.\nUsing ChatGPT plan / Manage usage: ${MANAGE_USAGE}\n${startMessage(started)}\n${CREDIT_NOTICE}` };
-          }
-          if (action === 'models') { const models = await adapter.listModelsFresh('siwc', signal); return { kind: 'success', text: models.map(m => `${m.id}: ${m.name}`).join('\n') }; }
-          if (action === 'model' && value) { await saveModel(auth, adapter, value); return { kind: 'success', text: `選択を保存しました: ${value}。既存のdshモデル選択でSIWCの同じモデルを選択してください。` }; }
-          if (action === 'select' && value) { adapter.cancelRequests(); await auth.select(value); return { kind: 'success', text: '登録を切り替えました。新しい会話を開始してください。\n' + await statusText(auth, adapter) }; }
-          if (action === 'sign-out') { adapter.cancelRequests(); const result = await auth.signOut(signal); return { kind: 'success', text: result.remoteRevocation === 'confirmed' ? 'ローカルトークンを削除し、公式の失効応答を確認しました。' : `ローカルトークンを削除しました。リモート失効は未確認です。ChatGPT設定でDisconnectを確認してください。${MANAGE_USAGE}` }; }
-          if (action === 'manage') return { kind: 'success', text: `Manage usage: ${MANAGE_USAGE}` };
-          if (action === 'resume') {
-            if (value !== 'confirmed') return { kind: 'success', text: `推論は再開していません。本人が ${MANAGE_USAGE} で対象アプリのクレジット不使用設定を保存・確認し、停止前の利用を再開する場合だけ /siwc resume confirmed を実行してください。検証予算の累計はリセットしません。` };
-            await resumeInference({ settingsConfirmed: true }); adapter.resetUsageLimit();
-            return { kind: 'success', text: '本人の設定確認・開始操作で停止前の利用を再開しました。検証の6要求予算と累計を保持しています。' };
-          }
-          if (action !== 'status') return { kind: 'error', text: '使い方: /siwc status | login | confirm | models | model <slug> | select <id> | sign-out | manage | resume' };
-          return { kind: 'success', text: await statusText(auth, adapter) };
         } catch (error) { return { kind: 'error', text: safeFailure(error) }; }
       },
     });

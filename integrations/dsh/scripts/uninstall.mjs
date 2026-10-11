@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { paths, runDsh, WEB_PROFILE } from './dsh-env.mjs';
 
 if (process.argv.slice(2).length) throw new Error('この削除操作はプラグイン登録だけを解除します。認証状態やファイルの削除は本人が対象を確認して行ってください。');
-for (const profile of [WEB_PROFILE, 'siwc-live']) {
+for (const profile of [WEB_PROFILE, 'siwc-live', 'siwc-e2e']) {
   if (!existsSync(join(paths.home, 'profiles', profile, 'package.json'))) {
     console.log(`UNINSTALL_OK: ${profile} は未導入です。`);
     continue;

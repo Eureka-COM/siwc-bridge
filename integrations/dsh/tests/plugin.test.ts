@@ -1,58 +1,41 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../lib/index.js';
-import { testLedger } from '../lib/ledger.js';
 
-test('公開llm/stream入口は画像・ファイル添付を通し、未知の内容だけを送信前に拒否する', async () => {
-  const events = new Map<string, Function>(); let called = 0;
-  const context = { llm: { registerAdapter() { return { replace() {} }; } }, effect() {}, on(name: string, callback: Function) { events.set(name, callback); }, inject() {} };
-  apply(context as never);
-  // Attachments are no longer refused at the Agent boundary.
-  assert.equal(events.has('agent/pre-step'), false); assert.equal(events.has('agent/request'), false);
-  const middleware = events.get('llm/stream'); assert.ok(middleware);
-  const next = async function* () { called++; yield { type: 'finish', reason: { kind: 'stop' } }; };
-  for (const type of ['audio', 'unknown']) {
-    const iterable = middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'user', content: [{ type }] }] }, next);
-    await assert.rejects(async () => { for await (const _ of iterable) {} }, { code: 'UNSUPPORTED_CONTENT' });
-  }
-  assert.equal(called, 0);
-  for (const type of ['image', 'file']) {
-    for await (const _ of middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'user', content: [{ type: 'text', text: 'see attached' }, { type }] }] }, next)) {}
-  }
-  assert.equal(called, 2);
-  for await (const _ of middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'user', content: [{ type: 'text', text: 'fixture' }] }] }, next)) {}
-  assert.equal(called, 3);
-  for await (const _ of middleware({ provider: 'siwc', model: 'fixture-only', messages: [{ role: 'developer', content: [{ type: 'tool-addition', tools: [] }, { type: 'tool-removal', names: [] }] }] }, next)) {}
-  assert.equal(called, 4);
-});
-
-test('slash resume requires explicit settings confirmation and preserves the stopped verification budget', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'siwc-dsh-command-'));
-  const previousLocal = process.env.LOCALAPPDATA; const previousFetch = globalThis.fetch;
-  process.env.LOCALAPPDATA = directory;
-  let handler: Function | undefined; let requests = 0;
-  globalThis.fetch = async () => { requests++; throw new Error('No network permitted in command fixture'); };
+function load() {
+  const events = new Map<string, Function>(); let handler: Function | undefined; const registered: string[][] = [];
   const context = {
-    llm: { registerAdapter() {} }, effect() {}, on() {},
+    llm: { registerAdapter(providers: string[]) { registered.push(providers); return { replace() {} }; } },
+    effect() {}, get() { return undefined; },
+    on(name: string, callback: Function) { events.set(name, callback); },
     inject(_names: string[], callback: Function) { callback({ commands: { register(command: { handler: Function }) { handler = command.handler; } } }); },
   };
+  apply(context as never);
+  return { events, registered, invoke: (rawInput: string) => handler!({ rawInput, signal: new AbortController().signal }) };
+}
+
+test('the plugin registers one provider and one command, and no longer refuses attachments or history at the Agent boundary', () => {
+  const { events, registered } = load();
+  assert.deepEqual(registered, [['siwc']]);
+  for (const hook of ['agent/pre-step', 'agent/request', 'llm/stream']) assert.equal(events.has(hook), false, hook);
+});
+
+test('/siwc commands that need no sign-in respond without any network request', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'siwc-dsh-command-'));
+  const previous = process.env.LOCALAPPDATA; process.env.LOCALAPPDATA = directory;
+  let requests = 0;
+  t.mock.method(globalThis, 'fetch', async () => { requests++; throw new Error('No network in this fixture'); });
   try {
-    apply(context as never); assert.ok(handler);
-    const ledger = testLedger(join(directory, 'siwc-bridge-dsh', 'verification.json'));
-    const invoke = (rawInput: string) => handler!({ rawInput, signal: new AbortController().signal });
-    assert.equal((await invoke('resume confirmed')).kind, 'error');
-    await ledger.arm(); await ledger.request('inference'); await ledger.stop();
-    const guidance = await invoke('resume'); assert.equal(guidance.kind, 'success');
-    assert.match(guidance.text, /再開していません/); assert.equal((await ledger.status()).armed, false);
-    const confirmed = await invoke('resume confirmed'); assert.equal(confirmed.kind, 'success');
-    assert.equal((await ledger.status()).armed, true); assert.equal((await ledger.status()).inference, 1);
-    assert.equal((await ledger.status()).personalUse, false); assert.equal(requests, 0);
-  } finally {
-    if (previousLocal === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previousLocal;
-    globalThis.fetch = previousFetch;
-    await rm(directory, { recursive: true, force: true });
-  }
+    const { invoke } = load();
+    assert.match((await invoke('manage')).text, /chatgpt\.com\/settings\/usage/);
+    assert.equal((await invoke('resume')).kind, 'success');
+    const unknown = await invoke('nonsense'); assert.equal(unknown.kind, 'error'); assert.match(unknown.text, /\/siwc/);
+    assert.equal((await invoke('model')).kind, 'error');
+    assert.equal((await invoke('select')).kind, 'error');
+    assert.match((await invoke('diagnostics')).text, /診断ログ/);
+    assert.equal(requests, 0);
+  } finally { if (previous === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous; }
 });

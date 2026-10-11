@@ -46,7 +46,8 @@ for (const scenario of ['completed', 'disconnected']) {
       assert.ok(events.some(event => event.type === 'final' && event.text.includes(marker)));
       assert.ok(events.some(event => event.phase === 'turn_end' && event.reason?.kind === 'completed'));
     } else {
-      assert.notEqual(result.code, 0); assert.equal(requests.inferenceRequests, 1);
+      // An interrupted stream is retried by DSH's retry policy (1 + 4 attempts), and its tool call never runs.
+      assert.notEqual(result.code, 0); assert.equal(requests.inferenceRequests, 5);
       assert.equal(guards.allowedCalls.length, 0); assert.equal(guards.results.length, 0);
       assert.equal(events.filter(event => event.type === 'tool_call').length, 0);
     }

@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
-import { initializeProfile, paths, resolveNpmCli, runDsh, runNode, verifiedArchive, verifyInstalledPlugin, WEB_PROFILE, writeIsolationPatch } from './dsh-env.mjs';
+import { initializeProfile, paths, resolveNpmCli, runDsh, runNode, verifiedArchive, verifyInstalledPlugin, WEB_PROFILE, writeRuntimePatch } from './dsh-env.mjs';
 
 await mkdir(paths.workspace, { recursive: true });
 const npmCli = resolveNpmCli();
@@ -22,7 +22,7 @@ if (previous.stdout.includes('name: dsh-siwc-bridge')) {
 }
 const installed = await runDsh(['plugin', '--profile', WEB_PROFILE, 'add', '--ignore-scripts', archive], { timeoutMs: 180_000 });
 if (installed.code !== 0) throw new Error('ローカルプラグインの dsh 導入に失敗しました。');
-await writeIsolationPatch(join(paths.work, 'web-isolation.patch.yml'), { webCredentials: true });
+await writeRuntimePatch(join(paths.work, 'runtime.patch.yml'), { webCredentials: true });
 const verified = await runDsh(['--profile', WEB_PROFILE, '--dump-config'], { capture: true });
 if (verified.code !== 0 || !verified.stdout.includes('dsh-siwc-bridge')) throw new Error('dsh profile にプラグインが見つかりません。');
 if (!existsSync(archive)) throw new Error('導入アーカイブが見つかりません。');
@@ -30,4 +30,4 @@ const profileRequire = createRequire(join(paths.home, 'profiles', WEB_PROFILE, '
 if (!existsSync(profileRequire.resolve('dsh-siwc-bridge/web-credentials'))) throw new Error('導入済みWeb資格情報プラグインが見つかりません。');
 const comparison = await verifyInstalledPlugin(WEB_PROFILE);
 if (comparison.mismatches.length) throw new Error(`導入済みプラグインが現ビルドと一致しません（${comparison.mismatches.length}件）。`);
-console.log(`SETUP_OK: ${archive}\n開始: npm.cmd start\n削除: npm.cmd run remove:plugin`);
+console.log(`SETUP_OK: ${archive}\nサインイン: node lib/cli.js login（またはDSH画面で /siwc login）\n開始: npm.cmd start\n削除: npm.cmd run remove:plugin`);

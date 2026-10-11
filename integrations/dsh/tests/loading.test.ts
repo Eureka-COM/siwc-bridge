@@ -60,7 +60,7 @@ test('a saved catalog is served at once while one background GET refreshes it', 
   let release!: (response: Response) => void; let requests = 0;
   t.mock.method(globalThis, 'fetch', async () => { requests++; return new Promise<Response>(resolve => { release = resolve; }); });
   const store = memoryCatalog([{ id: 'fixture-model', name: 'Saved' }]);
-  const adapter = new SiwcAdapter(credentials(), {}, { catalogStore: store });
+  const adapter = new SiwcAdapter(credentials(), { catalogStore: store });
   let updates = 0; adapter.onCatalogUpdated = () => { updates++; };
   assert.deepEqual((await adapter.listModels('siwc')).map(model => [model.id, model.name]), [['fixture-model', 'Saved']]);
   assert.equal((await adapter.resolveModel('siwc', 'fixture-model')).id, 'fixture-model');
@@ -75,7 +75,7 @@ test('a saved catalog is served at once while one background GET refreshes it', 
 
 test('a failed background refresh keeps the saved catalog and does not notify', async t => {
   t.mock.method(globalThis, 'fetch', async () => Response.json({ error: { code: 'fixture_error' } }, { status: 503 }));
-  const adapter = new SiwcAdapter(credentials(), {}, { catalogStore: memoryCatalog([{ id: 'fixture-model', name: 'Saved' }]) });
+  const adapter = new SiwcAdapter(credentials(), { catalogStore: memoryCatalog([{ id: 'fixture-model', name: 'Saved' }]) });
   let updates = 0; adapter.onCatalogUpdated = () => { updates++; };
   await adapter.listModels('siwc'); await settle();
   assert.equal(updates, 0);
@@ -93,12 +93,12 @@ test('the memory catalog is reused for ten minutes and never across registration
   active = 'fixture-b'; await adapter.listModels('siwc'); assert.equal(requests, 2);
 });
 
-test('signed-out or unconfirmed registrations never reuse a catalog', async t => {
-  let requests = 0; let confirmed = true;
+test('a signed-out registration never reuses a catalog', async t => {
+  let requests = 0; let signedIn = true;
   t.mock.method(globalThis, 'fetch', async () => { requests++; return catalog(['fixture-model']); });
-  const adapter = new SiwcAdapter({ status: async () => ({ activeId: registration, registrations: [{ id: registration, authenticated: true, planAllowed: true, planConfirmed: confirmed }] }),
+  const adapter = new SiwcAdapter({ status: async () => ({ activeId: registration, registrations: [{ id: registration, authenticated: signedIn, planAllowed: signedIn, planConfirmed: true }] }),
     withAccessToken: operation => operation('fake-access-never-real', undefined, registration) });
-  await adapter.listModels('siwc'); confirmed = false;
+  await adapter.listModels('siwc'); signedIn = false;
   await adapter.listModels('siwc'); assert.equal(requests, 2);
 });
 
@@ -118,7 +118,7 @@ test('inference sends no catalog GET and a service rejection shows its HTTP stat
     assert.equal(error.providerCode, 'model_not_found'); assert.match(error.message, /http=400/); assert.match(error.message, /request_id=req_fixture/);
     assert.equal(error.message.includes('FAKE_SECRET_ECHO'), false); return true;
   });
-  assert.equal(inference, 2, 'No automatic resend.');
+  assert.equal(inference, 2, 'A 400 is not resent by the adapter itself.');
 });
 
 test('the disk catalog keeps only slugs and display names for one registration', async () => {

@@ -4,39 +4,34 @@ import { isDeepStrictEqual } from 'node:util';
 import { BridgeError } from './errors.js';
 import { reasoningRequest } from './reasoning.js';
 
-export const TOOL_NAMESPACE = 'dsh';
-const MAX_EVENT = 2 * 1024 * 1024;
-const MAX_RESPONSE = 16 * 1024 * 1024;
-export const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
-function fail(code = 'INVALID_STREAM', reason = 'stream.schema_invalid'): never {
-  // Every caller supplies a static schema label, safe numeric position, or
-  // the explicitly filtered event.type below. Never interpolate response values.
-  throw new BridgeError(code, `SIWC応答の形式または完了状態を確認できませんでした。(reason=${reason})`);
-}
-const integer = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
-const identifier = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\u0000-\u0020\u007f]/.test(value);
-
-/** Only machine labels are retained. Provider messages/detail can reflect submitted secrets or text. */
-const diagnostic = (value: unknown, pattern: RegExp, maximum: number): string | undefined =>
-  typeof value === 'string' && value.length <= maximum && pattern.test(value) ? value : undefined;
-
-function invalid(reason: string, event?: Record<string, unknown>): never {
-  const position = event ? ['sequence_number', 'output_index', 'content_index', 'streamed_count', 'completed_count']
-    .filter(key => integer(event[key])).map(key => `;${key}=${event[key]}`).join('') : '';
-  return fail('INVALID_STREAM', reason + position);
-}
-
 /**
- * Events outside the Responses namespace (service notices such as rate-limit
- * snapshots or keep-alives) carry no output item, text or tool call. They are
- * skipped; a turn still succeeds only through response.completed. A type that
- * is not a plain machine label is never treated as a notice.
+ * DSH ↔ Responses translation for the ChatGPT-plan route (SIWC).
+ *
+ * Design rule: be strict only where a mistake would act on the user's behalf
+ * (a tool call is released only after the whole response completed) or leak
+ * data (provider text is never echoed into diagnostics). Everything else is
+ * tolerant: unknown events are skipped, history that cannot be replayed
+ * natively is resent as plain history, and options the route does not support
+ * are left out instead of failing the turn. Each such decision is recorded as
+ * a machine label in `Notes` for the local diagnostics log.
  */
-export const serviceNotice = (type: string): boolean => type !== 'error' && !type.startsWith('response.') && type.length <= 120 && /^[a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+)*$/.test(type);
 
-function unsupportedEvent(type: string): never {
-  const safeType = diagnostic(type, /^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*$/, 120) ?? 'redacted';
-  return fail('UNSUPPORTED_STREAM_EVENT', `event.type=${safeType}`);
+export const TOOL_NAMESPACE = 'dsh';
+const MAX_EVENT = 4 * 1024 * 1024;
+const MAX_RESPONSE = 32 * 1024 * 1024;
+export const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const integer = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
+const text = (value: unknown): value is string => typeof value === 'string';
+/** Only plain machine labels ever reach messages or logs; provider text can reflect submitted secrets. */
+export const label = (value: unknown, maximum = 120): string | undefined =>
+  typeof value === 'string' && value.length > 0 && value.length <= maximum && /^[A-Za-z0-9_.:\-[\]]+$/.test(value) ? value : undefined;
+
+/** Machine labels describing what was skipped or adjusted; written to the diagnostics log only. */
+export class Notes {
+  private readonly rows = new Map<string, number>();
+  add(name: string): void { const key = label(name, 160) ?? 'redacted'; this.rows.set(key, (this.rows.get(key) ?? 0) + 1); }
+  get size(): number { return this.rows.size; }
+  list(): string[] { return [...this.rows].map(([name, count]) => count > 1 ? `${name}x${count}` : name); }
 }
 
 export class ProviderFailure extends BridgeError {
@@ -46,21 +41,27 @@ export class ProviderFailure extends BridgeError {
   }
 }
 
+const MESSAGES: Record<string, string> = {
+  subscription_sharing_usage_limit_exceeded: 'ChatGPTプランの利用上限に達しました。ChatGPTの設定 → Usage（Manage usage）で、プランまたはこのアプリの上限を確認してください。',
+  subscription_sharing_usage_unavailable: 'ChatGPTの利用枠を確認できませんでした。しばらくしてから再実行してください。',
+  subscription_sharing_user_unavailable: 'ChatGPTのアカウント情報を一時的に確認できません。しばらくしてから再実行してください。',
+  subscription_sharing_user_not_eligible: 'このアカウントまたはworkspaceでは、ChatGPTプランをこのアプリで使えません。',
+  subscription_sharing_unsupported_capability: 'ChatGPTプラン経由では使えない機能が要求に含まれていました。',
+  subscription_sharing_route_not_supported: 'この接続方法はChatGPTプラン経由では使えません。',
+  subscription_sharing_invalid_user: 'サインイン情報を確認できませんでした。/siwc status で状態を確認してください。',
+  context_length_exceeded: '会話がモデルの上限を超えました。',
+};
+
+/** Classify an error body by its codes only; provider prose is never kept. */
 export function providerFailure(body: unknown, status?: number, requestId?: unknown): ProviderFailure {
   const root = object(body) ? body : {};
   const detail = object(root.error) ? root.error : root;
-  const code = diagnostic(typeof root.error === 'string' ? root.error : detail.code, /^[a-z][a-z0-9_]*$/, 100)
-    ?? (status === 401 ? 'unauthorized' : status === 403 ? 'forbidden' : status === 429 ? 'rate_limit' : status === 503 ? 'service_unavailable' : 'provider_error');
-  const param = diagnostic(detail.param, /^[A-Za-z0-9_.\[\]-]+$/, 120);
-  const id = diagnostic(requestId ?? root.request_id, /^[A-Za-z0-9_-]+$/, 160);
+  const code = label(typeof root.error === 'string' ? root.error : detail.code, 100) ?? label(detail.type, 100)
+    ?? (status === 401 ? 'unauthorized' : status === 403 ? 'forbidden' : status === 429 ? 'rate_limit' : status !== undefined && status >= 500 ? 'service_unavailable' : 'provider_error');
+  const param = label(detail.param);
+  const id = label(requestId ?? root.request_id, 160);
   const shape = object(root.error) ? 'structured_error' : typeof root.error === 'string' ? 'oauth_error' : typeof root.detail === 'string' ? 'detail' : 'other';
-  const messages: Record<string, string> = {
-    subscription_sharing_usage_limit_exceeded: 'ChatGPTプラン利用の上限に達しました。公式Usage画面を確認し、再開は本人の操作で行ってください。',
-    subscription_sharing_usage_unavailable: 'ChatGPTの利用枠を確認できません。資格情報を保持し、時間を置いて再実行してください。',
-    subscription_sharing_user_not_eligible: '選択したアカウントまたはworkspaceではChatGPTプラン利用を許可されていません。',
-    subscription_sharing_unsupported_capability: 'SIWCで未対応の機能が要求されました。設定を確認してください。',
-  };
-  return new ProviderFailure(code, messages[code] ?? 'SIWC要求が拒否または中断されました。秘密を含み得るサービス本文は表示しません。', status, id, param, shape);
+  return new ProviderFailure(code, MESSAGES[code] ?? 'ChatGPTプランへの要求が拒否されました（内容は安全のため表示しません）。', status, id, param, shape);
 }
 
 /** Encoded request version of one attached image, prepared by the adapter from DSH's attachment service. */
@@ -72,174 +73,160 @@ export interface RequestMedia {
 }
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
-function textContent(message: RequestMessage): string {
-  return message.content.map(block => {
-    if (block.type !== 'text') throw new BridgeError('UNSUPPORTED_CONTENT', message.role === 'user' || message.role === 'tool'
-      ? 'この添付は送信形式に変換できませんでした。DSHを再起動して添付し直してください。'
-      : 'system・developer・assistantの履歴には画像やファイルを含められません。');
-    return block.text;
-  }).join('\n');
-}
+export interface BuildContext { registrationId?: string; media?: RequestMedia; notes?: Notes }
 
-/** User and tool content: text, plus images as native Responses input parts. Files never reach here (DSH projects them to text). */
-function richContent(message: RequestMessage, media?: RequestMedia): string | Record<string, unknown>[] {
-  if (!message.content.some(block => block.type === 'image')) return textContent(message);
-  if (!media) throw new BridgeError('UNSUPPORTED_CONTENT', '画像を読み込めませんでした。DSHの添付機能が有効か確認してください。');
+/** User and tool content: text, plus images as native input parts. */
+function content(message: RequestMessage, context: BuildContext): string | Record<string, unknown>[] {
   const parts: Record<string, unknown>[] = [];
   for (const block of message.content) {
     if (block.type === 'text') { if (block.text !== '') parts.push({ type: 'input_text', text: block.text }); continue; }
-    if (block.type !== 'image') throw new BridgeError('UNSUPPORTED_CONTENT', 'この添付は送信形式に変換できませんでした。DSHを再起動して添付し直してください。');
-    const version = media.images.get(block.attachment.attachmentId);
-    if (!version || !IMAGE_TYPES.has(version.mediaType) || !(version.data instanceof Uint8Array) || version.data.byteLength === 0) {
-      throw new BridgeError('UNSUPPORTED_CONTENT', '添付画像を送信用に準備できませんでした。添付し直してください。');
+    if (block.type === 'image') {
+      const version = context.media?.images.get(block.attachment.attachmentId);
+      if (version && IMAGE_TYPES.has(version.mediaType) && version.data instanceof Uint8Array && version.data.byteLength > 0 && context.media) {
+        parts.push({ type: 'input_text', text: context.media.handle(block.attachment, version) });
+        parts.push({ type: 'input_image', image_url: `data:${version.mediaType};base64,${Buffer.from(version.data).toString('base64')}`, detail: 'auto' });
+      } else {
+        context.notes?.add('request.image_unavailable');
+        parts.push({ type: 'input_text', text: `[An attached image${block.attachment?.name ? ` "${block.attachment.name}"` : ''} could not be loaded for this request.]` });
+      }
+      continue;
     }
-    parts.push({ type: 'input_text', text: media.handle(block.attachment, version) });
-    parts.push({ type: 'input_image', image_url: `data:${version.mediaType};base64,${Buffer.from(version.data).toString('base64')}`, detail: 'auto' });
+    if (block.type === 'file') {
+      // DSH projects files to their read-only path before the adapter; keep a visible trace if one arrives anyway.
+      context.notes?.add('request.file_block');
+      parts.push({ type: 'input_text', text: `[An attached file${block.attachment?.name ? ` "${block.attachment.name}"` : ''} is available to read with the file tools.]` });
+      continue;
+    }
+    context.notes?.add(`request.skipped_block.${label(block.type, 40) ?? 'unknown'}`);
   }
+  if (parts.every(part => part.type === 'input_text')) return parts.map(part => String(part.text)).join('\n');
   return parts;
 }
 
-function functionItem(value: unknown, allowed?: ReadonlySet<string>): Record<string, unknown> {
-  if (!object(value) || value.type !== 'function_call' || !identifier(value.call_id) || !identifier(value.name)
-    || value.namespace !== TOOL_NAMESPACE || typeof value.arguments !== 'string' || value.arguments.length > MAX_EVENT
-    || (value.status !== undefined && value.status !== 'completed') || value.async === true
-    || (object(value.caller) && value.caller.type !== 'direct') || (allowed && !allowed.has(value.name))) fail('INVALID_TOOL_CALL', 'function_call.schema_invalid');
-  let parsed: unknown;
-  try { parsed = JSON.parse(value.arguments); } catch { fail('INVALID_TOOL_ARGUMENTS', 'function_call.arguments_json_invalid'); }
-  if (!object(parsed)) fail('INVALID_TOOL_ARGUMENTS', 'function_call.arguments_object_required');
-  return structuredClone(value);
+function plainText(message: RequestMessage, context: BuildContext): string {
+  return message.content.flatMap(block => {
+    if (block.type === 'text') return [block.text];
+    if (block.type === 'tool-addition' || block.type === 'tool-removal' || block.type === 'reasoning') return [];
+    context.notes?.add(`request.skipped_block.${label(block.type, 40) ?? 'unknown'}`);
+    return [];
+  }).join('\n');
 }
 
-/** Build an allowlisted request; ordinary API options never pass through. */
-export function buildRequest(options: GenerateOptions, registrationId?: string, media?: RequestMedia): Record<string, unknown> {
-  const allowed = new Set(['provider', 'model', 'messages', 'system', 'tools', 'toolHistory', 'signal', 'sessionId', 'purpose', 'reasoningEffort']);
-  for (const [key, value] of Object.entries(options)) {
-    if (value !== undefined && !allowed.has(key)) throw new BridgeError('UNSUPPORTED_OPTION', `SIWC初期版では ${/^[A-Za-z_]+$/.test(key) ? key : '指定されたオプション'} に対応していません。`);
-  }
-  if (!identifier(options.model) || !Array.isArray(options.messages)) throw new BridgeError('INVALID_REQUEST', 'モデルと会話履歴を指定してください。');
+/** The visible text/tool-call blocks a stored reply is validated against before its native items are reused. */
+export function visibleOf(blocks: readonly Record<string, unknown>[]): Record<string, unknown>[] {
+  return blocks.flatMap((block): Record<string, unknown>[] => block.type === 'text' ? (block.text === '' ? [] : [{ type: 'text', text: block.text }])
+    : block.type === 'tool-call' ? [{ type: 'tool-call', id: block.id, name: block.name, arguments: block.arguments }] : []);
+}
+
+const REPLAY_TYPES = new Set(['message', 'reasoning', 'function_call']);
+/** Native items of a stored reply, or undefined when they must not be reused (other account, other model, edited history). */
+function nativeReplay(message: RequestMessage & { role: 'assistant' }, options: GenerateOptions, context: BuildContext): Record<string, unknown>[] | undefined {
+  const state = message.source.replayState;
+  if (state === undefined) return undefined;
+  const response = object(state) && object(state.response) ? state.response : undefined;
+  if (!response || response.kind !== 'siwc-responses' || !Array.isArray(response.output)) { context.notes?.add('replay.unknown_format'); return undefined; }
+  if (response.version !== 2 || context.registrationId === undefined || response.registrationId !== context.registrationId) { context.notes?.add('replay.other_registration'); return undefined; }
+  if (response.model !== options.model) { context.notes?.add('replay.other_model'); return undefined; }
+  if (!Array.isArray(response.visible) || !isDeepStrictEqual(response.visible, visibleOf(message.content as unknown as Record<string, unknown>[]))) { context.notes?.add('replay.content_changed'); return undefined; }
+  return response.output.filter((item): item is Record<string, unknown> => object(item) && REPLAY_TYPES.has(String(item.type))).map(item => structuredClone(item));
+}
+
+/** Options the ChatGPT-plan route rejects; they are left out rather than failing the turn. */
+const UNSUPPORTED_OPTIONS = ['temperature', 'maxTokens', 'stop', 'topP', 'top_p', 'presencePenalty', 'frequencyPenalty', 'seed'];
+
+/** Build one Responses request. History shape never fails a turn; only a missing model or history stops before transport. */
+export function buildRequest(options: GenerateOptions, context: BuildContext = {}): Record<string, unknown> {
+  if (typeof options.model !== 'string' || options.model.length === 0 || !Array.isArray(options.messages)) throw new BridgeError('INVALID_REQUEST', 'モデルと会話履歴を指定してください。');
+  for (const key of UNSUPPORTED_OPTIONS) if ((options as unknown as Record<string, unknown>)[key] !== undefined) context.notes?.add(`request.option_omitted.${key}`);
   const reasoning = reasoningRequest(options.model, options.reasoningEffort);
+  if (options.reasoningEffort !== undefined && !reasoning?.effort) context.notes?.add('request.reasoning_effort_omitted');
   const input: Record<string, unknown>[] = [];
-  if (options.system !== undefined) input.push({ role: 'developer', content: options.system });
-  const calls = new Map<string, string>();
-  const answered = new Set<string>();
+  if (options.system !== undefined && options.system !== '') input.push({ role: 'developer', content: options.system });
+  const pending = new Set<string>(); const answered = new Set<string>(); const known = new Set<string>();
+  // Every function_call needs exactly one output before the conversation moves on;
+  // a call left open (cancelled turn, compaction) gets an explicit placeholder result.
+  const closeOpenCalls = () => {
+    for (const id of pending) { input.push({ type: 'function_call_output', call_id: id, output: '[No result: this tool call did not complete.]' }); answered.add(id); context.notes?.add('request.open_call_closed'); }
+    pending.clear();
+  };
+  const addCall = (id: string, name: string, args: string, item?: Record<string, unknown>) => {
+    if (known.has(id)) { context.notes?.add('request.duplicate_call_skipped'); return; }
+    known.add(id); pending.add(id);
+    input.push(item ?? { type: 'function_call', namespace: TOOL_NAMESPACE, call_id: id, name, arguments: args === '' ? '{}' : args });
+  };
   for (const message of options.messages) {
     if (message.role === 'tool') {
-      if (!calls.has(message.toolCallId) || answered.has(message.toolCallId)) throw new BridgeError('INVALID_TOOL_HISTORY', 'ツール結果のcall IDに対応する呼出しがないか、結果が重複しています。');
-      answered.add(message.toolCallId);
-      input.push({ type: 'function_call_output', call_id: message.toolCallId, output: richContent(message, media) });
+      const output = content(message, context);
+      if (pending.has(message.toolCallId)) {
+        pending.delete(message.toolCallId); answered.add(message.toolCallId);
+        input.push({ type: 'function_call_output', call_id: message.toolCallId, output });
+      } else {
+        // A result without its call (or a second result) is kept as context, not dropped.
+        context.notes?.add(answered.has(message.toolCallId) ? 'request.duplicate_tool_result' : 'request.orphan_tool_result');
+        const body = typeof output === 'string' ? output : output.filter(part => part.type === 'input_text').map(part => String(part.text)).join('\n');
+        if (body !== '') input.push({ role: 'user', content: `[Earlier tool result]\n${body}` });
+      }
       continue;
     }
+    closeOpenCalls();
     if (message.role === 'assistant') {
-      const state = message.source.replayState;
-      if (state !== undefined) {
-        if (!object(state) || !object(state.response) || state.response.kind !== 'siwc-responses' || (state.response.version !== 1 && state.response.version !== 2)
-          || !identifier(state.response.model) || !Array.isArray(state.response.output)) throw new BridgeError('INVALID_REPLAY_STATE', 'SIWC会話履歴の再利用情報が不正です。');
-        if (registrationId !== undefined && (state.response.version !== 2 || state.response.registrationId !== registrationId)) {
-          throw new BridgeError('INVALID_REPLAY_CONTEXT', '会話の内部履歴は元の登録だけで再利用できます。登録を切り替えた場合や旧版の会話は、新しい会話を開始してください。');
+      const native = nativeReplay(message, options, context);
+      if (native) {
+        for (const item of native) {
+          if (item.type === 'function_call' && text(item.call_id)) addCall(item.call_id, String(item.name), String(item.arguments ?? ''), item);
+          else input.push(item);
         }
-        if (state.response.version === 2 && !identifier(state.response.registrationId)) throw new BridgeError('INVALID_REPLAY_STATE', 'SIWC会話履歴の登録情報が不正です。');
-        const sameModel = state.response.model === options.model;
-        const replayCalls = new Set<string>();
-        for (const raw of state.response.output) {
-          if (!object(raw) || !['message', 'reasoning', 'function_call'].includes(String(raw.type))) throw new BridgeError('INVALID_REPLAY_STATE', 'SIWC会話履歴の再利用情報が不正です。');
-          if (raw.type === 'function_call') {
-            const call = functionItem(raw);
-            if (calls.has(String(call.call_id)) || replayCalls.has(String(call.call_id))) throw new BridgeError('INVALID_TOOL_HISTORY', 'ツールcall IDが重複しています。');
-            replayCalls.add(String(call.call_id));
-            if (sameModel) calls.set(String(call.call_id), String(call.name));
-            const block = message.content.find(block => block.type === 'tool-call' && block.id === call.call_id);
-            if (!block || block.type !== 'tool-call' || block.name !== call.name || block.arguments !== call.arguments) throw new BridgeError('INVALID_REPLAY_STATE', '保存された呼出しと再利用情報が一致しません。');
-          }
-          if (raw.type === 'message' && (raw.role !== 'assistant' || !Array.isArray(raw.content)
-            || raw.content.some(part => !object(part) || !['output_text', 'refusal'].includes(String(part.type))
-              || typeof (part.type === 'output_text' ? part.text : part.refusal) !== 'string'))) throw new BridgeError('INVALID_REPLAY_STATE', '再利用するassistantメッセージの形式が不正です。');
-          if (sameModel) input.push(structuredClone(raw));
-        }
-        const nativeVisible = [...state.response.output.filter(raw => (raw as Record<string, unknown>).type === 'message'),
-          ...state.response.output.filter(raw => (raw as Record<string, unknown>).type === 'function_call')].flatMap<Record<string, unknown>>(raw => {
-          const item = raw as Record<string, unknown>;
-          if (item.type === 'function_call') return [{ type: 'tool-call', id: item.call_id, name: item.name, arguments: item.arguments }];
-          if (item.type === 'message') return (item.content as Record<string, unknown>[]).map(part => ({ type: 'text', text: part.type === 'output_text' ? part.text : part.refusal }));
-          return [];
-        });
-        const visible = nativeVisible.filter(part => part.type !== 'text' || part.text !== '');
-        const canonical = message.content.map(block => block.type === 'text' ? { type: block.type, text: block.text }
-          : block.type === 'tool-call' ? { type: block.type, id: block.id, name: block.name, arguments: block.arguments } : { type: block.type });
-        // The harness may have removed or rewritten content during compaction.
-        // Never reintroduce pre-compaction text or calls through opaque metadata.
-        const snapshot = state.response.visible;
-        if (snapshot === undefined) {
-          // Legacy v1 envelopes used the native text/call order.
-          if (JSON.stringify(visible) !== JSON.stringify(canonical)) throw new BridgeError('INVALID_REPLAY_STATE', '現在の会話contentとSIWC再利用情報が一致しません。');
-        } else {
-          if (!Array.isArray(snapshot) || !isDeepStrictEqual(snapshot, canonical)) throw new BridgeError('INVALID_REPLAY_STATE', '現在の会話contentとSIWC表示順の保存情報が一致しません。');
-          // A terminal-only item can arrive after another item's live text.
-          // Verify the actual display order separately, while requiring exactly
-          // the same native text/call values and multiplicities in that order.
-          const inventory = (parts: Record<string, unknown>[]) => parts.filter(part => part.type !== 'text' || part.text !== '').map(part => JSON.stringify(part)).sort();
-          const emptyTexts = (parts: Record<string, unknown>[]) => parts.filter(part => part.type === 'text' && part.text === '').length;
-          if (!isDeepStrictEqual(inventory(snapshot), inventory(visible)) || emptyTexts(snapshot) > emptyTexts(nativeVisible)) throw new BridgeError('INVALID_REPLAY_STATE', '保存された表示内容とネイティブ応答の内容または個数が一致しません。');
-        }
-        // Opaque reasoning is never interpreted or converted to a visible reasoning block.
-        if (sameModel) continue;
-        // A model change keeps explicit text, call IDs and tool results, while
-        // rebuilding them below without the previous model's opaque reasoning/item IDs.
+        continue;
       }
       for (const block of message.content) {
-        if (block.type === 'text') input.push({ role: 'assistant', content: block.text });
-        else if (block.type === 'tool-call') {
-          if (calls.has(block.id)) throw new BridgeError('INVALID_TOOL_HISTORY', 'ツールcall IDが重複しています。');
-          const call = functionItem({ type: 'function_call', namespace: TOOL_NAMESPACE, call_id: block.id, name: block.name, arguments: block.arguments });
-          calls.set(block.id, block.name); input.push(call);
-        } else throw new BridgeError('UNSUPPORTED_CONTENT', 'ネイティブ再利用情報のないreasoningや非テキスト履歴は送信できません。');
+        if (block.type === 'text') { if (block.text !== '') input.push({ role: 'assistant', content: block.text }); }
+        else if (block.type === 'tool-call') addCall(block.id, block.name, block.arguments);
+        else if (block.type !== 'reasoning') context.notes?.add(`request.skipped_block.${label(block.type, 40) ?? 'unknown'}`);
       }
       continue;
     }
-    if (!['system', 'developer', 'user'].includes(message.role)) throw new BridgeError('UNSUPPORTED_CONTENT', '未対応の会話roleです。');
     if (message.role === 'user') {
-      const content = richContent(message, media);
-      if (content !== '' && !(Array.isArray(content) && content.length === 0)) input.push({ role: 'user', content });
+      const value = content(message, context);
+      if (value !== '' && !(Array.isArray(value) && value.length === 0)) input.push({ role: 'user', content: value });
       continue;
     }
-    const text = textContent(message);
-    if (text !== '') input.push({ role: message.role === 'system' ? 'developer' : message.role, content: text });
+    // system and developer: the route rejects role "system" items.
+    const value = plainText(message, context);
+    if (value !== '') input.push({ role: 'developer', content: value });
   }
+  closeOpenCalls();
   const body: Record<string, unknown> = { model: options.model, input, store: false, stream: true };
   if (reasoning) body.reasoning = reasoning;
+  // Opaque reasoning is needed to continue a reasoning model's work with store:false.
+  body.include = ['reasoning.encrypted_content'];
   if (options.tools?.length) {
     const names = new Set<string>();
-    body.tools = [{ type: 'namespace', name: TOOL_NAMESPACE, description: 'Tools executed by the local DeepSeek Harness with its existing approval policy.',
-      tools: options.tools.map(tool => {
-        if (!/^[A-Za-z0-9_-]{1,128}$/.test(tool.name) || names.has(tool.name) || !object(tool.parameters) || tool.deferLoading) throw new BridgeError('UNSUPPORTED_TOOL', 'tool名・schema・deferred loadingを確認してください。');
-        names.add(tool.name);
-        return { type: 'function', name: tool.name, description: tool.description, parameters: tool.parameters, strict: false };
-      }) }];
+    const tools = options.tools.flatMap(tool => {
+      if (names.has(tool.name)) { context.notes?.add('request.duplicate_tool_skipped'); return []; }
+      names.add(tool.name);
+      return [{ type: 'function', name: tool.name, description: tool.description ?? '', parameters: object(tool.parameters) ? tool.parameters : { type: 'object', properties: {} }, strict: false }];
+    });
+    body.tools = [{ type: 'namespace', name: TOOL_NAMESPACE, description: 'Tools executed by the local DeepSeek Harness with its own approval policy.', tools }];
   }
   return body;
 }
 
-/** SSE framing is independent of the HTTP transport and accepts arbitrarily split UTF-8 bytes. */
-export async function* readSse(body: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
+/** SSE framing; tolerant of unknown fields and comments, bounded in size. */
+export async function* readSse(body: ReadableStream<Uint8Array>, signal?: AbortSignal, notes?: Notes): AsyncGenerator<Record<string, unknown>> {
   const reader = body.getReader();
-  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const decoder = new TextDecoder('utf-8');
   let pending = '', total = 0;
   const abort = () => { void reader.cancel().catch(() => undefined); };
   signal?.addEventListener('abort', abort, { once: true });
   const parse = (frame: string): Record<string, unknown> | undefined => {
-    const data: string[] = []; let type: string | undefined;
-    for (const line of frame.split(/\r?\n/)) {
-      if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
-      else if (line.startsWith('event:')) type = line.slice(6).trim();
-      else if (line === '' || line.startsWith(':') || /^(id|retry):/.test(line)) continue;
-      else invalid('sse.frame_field_invalid');
-    }
+    const data: string[] = [];
+    for (const line of frame.split(/\r?\n/)) if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
     if (!data.length) return undefined;
     const value = data.join('\n');
-    if (value === '[DONE]') return undefined; // This marker does not establish Responses completion.
-    let event: unknown; try { event = JSON.parse(value); } catch { invalid('sse.json_invalid'); }
-    if (!object(event)) invalid('sse.event_object_required');
-    if (typeof event.type !== 'string') invalid('sse.event_type_string_required');
-    if (type !== undefined && type !== event.type) invalid('sse.event_name_mismatch');
+    if (value === '[DONE]') return undefined;
+    let event: unknown;
+    try { event = JSON.parse(value); } catch { notes?.add('sse.unparsable_frame'); return undefined; }
+    if (!object(event) || typeof event.type !== 'string') { notes?.add('sse.untyped_frame'); return undefined; }
     return event;
   };
   try {
@@ -249,22 +236,22 @@ export async function* readSse(body: ReadableStream<Uint8Array>, signal?: AbortS
       signal?.throwIfAborted();
       if (done) { pending += decoder.decode(); break; }
       total += value.byteLength;
-      if (total > MAX_RESPONSE) fail('RESPONSE_TOO_LARGE', 'sse.response_byte_limit');
+      if (total > MAX_RESPONSE) throw new BridgeError('RESPONSE_TOO_LARGE', 'ChatGPTの応答が大きすぎるため中断しました。');
       pending += decoder.decode(value, { stream: true });
       let boundary: RegExpExecArray | null;
       while ((boundary = /\r?\n\r?\n/.exec(pending))) {
-        if (boundary.index > MAX_EVENT) fail('RESPONSE_TOO_LARGE', 'sse.event_size_limit');
         const frame = pending.slice(0, boundary.index);
         pending = pending.slice(boundary.index + boundary[0].length);
+        if (frame.length > MAX_EVENT) throw new BridgeError('RESPONSE_TOO_LARGE', 'ChatGPTの応答イベントが大きすぎるため中断しました。');
         const event = parse(frame); if (event) yield event;
       }
-      if (pending.length > MAX_EVENT) fail('RESPONSE_TOO_LARGE', 'sse.pending_event_size_limit');
+      if (pending.length > MAX_EVENT) throw new BridgeError('RESPONSE_TOO_LARGE', 'ChatGPTの応答イベントが大きすぎるため中断しました。');
     }
-    if (pending.trim() !== '') fail('STREAM_INTERRUPTED', 'sse.unterminated_frame');
+    if (pending.trim() !== '') { const event = parse(pending); if (event) yield event; }
   } catch (error) {
     if (signal?.aborted) throw new BridgeError('CANCELLED', '中断しました。');
     if (error instanceof BridgeError) throw error;
-    invalid('sse.read_or_utf8_failure');
+    throw new BridgeError('STREAM_INTERRUPTED', 'ChatGPTからの応答が途中で途切れました。');
   } finally {
     signal?.removeEventListener('abort', abort);
     await reader.cancel().catch(() => undefined);
@@ -275,208 +262,176 @@ export async function* readSse(body: ReadableStream<Uint8Array>, signal?: AbortS
 export function mapUsage(value: unknown): TokenUsage | undefined {
   if (!object(value) || !integer(value.input_tokens) || !integer(value.output_tokens)) return undefined;
   const inputDetails = object(value.input_tokens_details) ? value.input_tokens_details : {};
-  const cached = inputDetails.cached_tokens, written = inputDetails.cache_write_tokens;
-  if ((cached !== undefined && !integer(cached)) || (written !== undefined && !integer(written))) return undefined;
-  const cacheRead = Number(cached ?? 0), cacheWrite = Number(written ?? 0);
-  if (cacheRead + cacheWrite > value.input_tokens) return undefined;
+  const cached = integer(inputDetails.cached_tokens) ? inputDetails.cached_tokens : undefined;
+  const written = integer(inputDetails.cache_write_tokens) ? inputDetails.cache_write_tokens : undefined;
+  const cacheRead = cached ?? 0, cacheWrite = written ?? 0;
+  if (cacheRead + cacheWrite > value.input_tokens) return { inputTokens: value.input_tokens, outputTokens: value.output_tokens };
   const usage: TokenUsage = { inputTokens: value.input_tokens - cacheRead - cacheWrite, outputTokens: value.output_tokens };
   if (cached !== undefined) usage.cacheReadTokens = cacheRead;
   if (written !== undefined) usage.cacheWriteTokens = cacheWrite;
-  if (integer(value.total_tokens) && value.total_tokens === value.input_tokens + value.output_tokens) usage.totalTokens = value.total_tokens;
+  if (integer(value.total_tokens)) usage.totalTokens = value.total_tokens;
   const outputDetails = object(value.output_tokens_details) ? value.output_tokens_details : {};
   if (integer(outputDetails.reasoning_tokens) && outputDetails.reasoning_tokens <= value.output_tokens) usage.reasoningTokens = outputDetails.reasoning_tokens;
   return usage;
 }
 
-interface ItemState { item: Record<string, unknown>; done?: Record<string, unknown>; fragments: string[]; argumentsLength: number; argumentsDone?: string }
-interface TextState { index: number; itemId: string; outputIndex: number; contentIndex: number; text: string; closed: boolean }
+interface Block { index: number; text: string; closed: boolean }
+interface Item { added: Record<string, unknown>; done?: Record<string, unknown>; args: string }
 
-/** Text is visible while streaming; every tool chunk is withheld until the entire response completes. */
+const IGNORED_EVENTS = new Set(['response.created', 'response.in_progress', 'response.queued', 'response.content_part.added', 'response.content_part.done',
+  'response.output_text.done', 'response.refusal.done', 'response.reasoning_summary_part.done', 'response.reasoning_summary_text.done',
+  'response.reasoning_text.delta', 'response.reasoning_text.done', 'response.function_call_arguments.done', 'response.output_text.annotation.added']);
+
+/**
+ * Turn Responses events into DSH stream chunks.
+ * - Text and reasoning summaries stream live.
+ * - Tool calls are released only from a completed response, never from partial events.
+ * - Events this adapter does not use are skipped (and noted), so new service
+ *   events never fail a turn. Success still requires response.completed.
+ */
 export class ResponseStream {
-  readonly items = new Map<number, ItemState>();
-  private readonly texts = new Map<string, TextState>();
+  private readonly items = new Map<number, Item>();
+  private readonly texts = new Map<string, Block>();
+  private readonly summaries = new Map<string, Block>();
   private nextIndex = 0;
-  private sequence = -1;
   completed = false;
-  constructor(private readonly model: string, private readonly allowedTools: ReadonlySet<string> = new Set(), private readonly registrationId?: string) {}
+  constructor(private readonly model: string, private readonly notes = new Notes(), private readonly registrationId?: string) {}
 
-  private item(event: Record<string, unknown>): ItemState {
-    if (!integer(event.output_index)) invalid('event_item.output_index_invalid', event);
-    const state = this.items.get(event.output_index);
-    if (!state) invalid('event_item.output_index_not_started', event);
-    if (!identifier(event.item_id)) invalid('event_item.item_id_invalid', event);
-    if (state.item.id !== event.item_id) invalid('event_item.item_id_mismatch', event);
-    return state;
-  }
-
-  private text(outputIndex: number, contentIndex: number, itemId: string, delta: string): StreamChunk[] {
-    const key = `${outputIndex}:${contentIndex}`;
-    let state = this.texts.get(key); const chunks: StreamChunk[] = [];
-    if (!state) {
-      state = { index: this.nextIndex++, itemId, outputIndex, contentIndex, text: '', closed: false };
-      this.texts.set(key, state); chunks.push({ type: 'block-start', index: state.index, blockType: 'text' });
-    }
-    if (state.closed) invalid('text.delta_after_block_closed');
-    if (state.itemId !== itemId) invalid('text.item_id_mismatch');
-    state.text += delta;
-    if (state.text.length > MAX_RESPONSE) fail('RESPONSE_TOO_LARGE', 'text.block_size_limit');
-    if (delta !== '') chunks.push({ type: 'text-delta', index: state.index, text: delta });
+  private append(map: Map<string, Block>, key: string, kind: 'text' | 'reasoning', delta: string): StreamChunk[] {
+    const chunks: StreamChunk[] = [];
+    let block = map.get(key);
+    if (!block) { block = { index: this.nextIndex++, text: '', closed: false }; map.set(key, block); chunks.push({ type: 'block-start', index: block.index, blockType: kind }); }
+    if (block.closed) { this.notes.add(`stream.${kind}_after_close`); return chunks; }
+    block.text += delta;
+    if (block.text.length > MAX_RESPONSE) throw new BridgeError('RESPONSE_TOO_LARGE', 'ChatGPTの応答が大きすぎるため中断しました。');
+    if (delta !== '') chunks.push(kind === 'text' ? { type: 'text-delta', index: block.index, text: delta } : { type: 'reasoning-delta', index: block.index, text: delta });
     return chunks;
   }
 
   accept(event: Record<string, unknown>): StreamChunk[] {
-    if (this.completed) invalid('event.after_response_completed', event);
-    if (typeof event.type !== 'string') invalid('event.type_string_required', event);
-    if (event.sequence_number !== undefined) {
-      if (!integer(event.sequence_number)) invalid('event.sequence_number_invalid', event);
-      if (event.sequence_number <= this.sequence) invalid('event.sequence_number_not_increasing', event);
-      this.sequence = event.sequence_number;
+    if (this.completed) { this.notes.add('stream.event_after_completion'); return []; }
+    const type = String(event.type);
+    switch (type) {
+      case 'error': throw providerFailure(event);
+      case 'response.failed': throw providerFailure(object(event.response) ? event.response : event);
+      case 'response.incomplete': return this.incomplete(event);
+      case 'response.completed': return this.complete(event);
+      case 'response.output_item.added':
+        if (integer(event.output_index) && object(event.item)) this.items.set(event.output_index, { added: structuredClone(event.item), args: '' });
+        return [];
+      case 'response.output_item.done':
+        if (integer(event.output_index) && object(event.item)) {
+          const item = this.items.get(event.output_index) ?? { added: structuredClone(event.item), args: '' };
+          item.done = structuredClone(event.item); this.items.set(event.output_index, item);
+        }
+        return [];
+      case 'response.output_text.delta':
+      case 'response.refusal.delta':
+        return text(event.delta) ? this.append(this.texts, `${event.output_index}:${event.content_index ?? 0}`, 'text', event.delta) : [];
+      case 'response.reasoning_summary_text.delta':
+        return text(event.delta) ? this.append(this.summaries, `${event.output_index}`, 'reasoning', event.delta) : [];
+      case 'response.reasoning_summary_part.added': {
+        // Later summary parts continue the same reasoning block as a new paragraph.
+        const block = this.summaries.get(`${event.output_index}`);
+        return block && block.text !== '' && !block.closed ? this.append(this.summaries, `${event.output_index}`, 'reasoning', '\n\n') : [];
+      }
+      case 'response.function_call_arguments.delta': {
+        const item = integer(event.output_index) ? this.items.get(event.output_index) : undefined;
+        if (item && text(event.delta)) item.args += event.delta;
+        return [];
+      }
+      default:
+        if (!IGNORED_EVENTS.has(type)) this.notes.add(`stream.skipped_event.${label(type) ?? 'redacted'}`);
+        return [];
     }
-    if (event.type === 'response.failed' || event.type === 'error') throw providerFailure(event.type === 'response.failed' ? event.response : event);
-    if (serviceNotice(event.type)) return [];
-    if (event.type === 'response.incomplete') fail('RESPONSE_INCOMPLETE', 'response.incomplete');
-    if (event.type === 'response.output_item.added') {
-      if (!integer(event.output_index)) invalid('output_item_added.output_index_invalid', event);
-      if (!object(event.item)) invalid('output_item_added.item_object_required', event);
-      if (!identifier(event.item.id)) invalid('output_item_added.item_id_invalid', event);
-      if (this.items.has(event.output_index)) invalid('output_item_added.duplicate_output_index', event);
-      if (!['message', 'function_call', 'reasoning'].includes(String(event.item.type))) invalid('output_item_added.item_type_unsupported', event);
-      this.items.set(event.output_index, { item: structuredClone(event.item), fragments: [], argumentsLength: 0 });
-    } else if (event.type === 'response.function_call_arguments.delta') {
-      const state = this.item(event);
-      if (state.item.type !== 'function_call') invalid('arguments_delta.item_type_mismatch', event);
-      if (state.done) invalid('arguments_delta.after_item_done', event);
-      if (state.argumentsDone !== undefined) invalid('arguments_delta.after_arguments_done', event);
-      if (typeof event.delta !== 'string') invalid('arguments_delta.delta_string_required', event);
-      state.fragments.push(event.delta);
-      state.argumentsLength += event.delta.length;
-      if (state.argumentsLength > MAX_EVENT) fail('RESPONSE_TOO_LARGE', 'arguments_delta.size_limit');
-    } else if (event.type === 'response.function_call_arguments.done') {
-      const state = this.item(event);
-      if (state.item.type !== 'function_call' || state.done || state.argumentsDone !== undefined || typeof event.arguments !== 'string'
-        || (state.fragments.length > 0 && state.fragments.join('') !== event.arguments)) fail('INVALID_TOOL_ARGUMENTS', 'arguments_done.schema_or_fragments_mismatch');
-      state.argumentsDone = event.arguments;
-    } else if (event.type === 'response.output_text.delta' || event.type === 'response.refusal.delta') {
-      const state = this.item(event);
-      if (state.item.type !== 'message') invalid('text_delta.item_type_mismatch', event);
-      if (state.done) invalid('text_delta.after_item_done', event);
-      if (!integer(event.content_index)) invalid('text_delta.content_index_invalid', event);
-      if (typeof event.delta !== 'string') invalid('text_delta.delta_string_required', event);
-      return this.text(Number(event.output_index), event.content_index, String(event.item_id), event.delta);
-    } else if (event.type === 'response.output_item.done') {
-      if (!integer(event.output_index)) invalid('output_item_done.output_index_invalid', event);
-      if (!object(event.item)) invalid('output_item_done.item_object_required', event);
-      const state = this.items.get(event.output_index);
-      if (!state) invalid('output_item_done.output_index_not_started', event);
-      if (state.done) invalid('output_item_done.duplicate_done', event);
-      if (state.item.id !== event.item.id) invalid('output_item_done.item_id_mismatch', event);
-      if (state.item.type !== event.item.type) invalid('output_item_done.item_type_mismatch', event);
-      if (event.item.status !== undefined && event.item.status !== 'completed') invalid('output_item_done.item_unfinished', event);
-      if (event.item.type === 'function_call') {
-        const call = functionItem(event.item, this.allowedTools);
-        if ((state.argumentsDone !== undefined && state.argumentsDone !== call.arguments)
-          || (state.fragments.length > 0 && state.fragments.join('') !== call.arguments)
-          || state.item.call_id !== call.call_id || state.item.name !== call.name || state.item.namespace !== call.namespace) fail('INVALID_TOOL_CALL', 'output_item_done.function_call_mismatch');
-      }
-      state.done = structuredClone(event.item);
-    } else if (event.type === 'response.completed') {
-      if (!object(event.response)) invalid('completed.response_object_required', event);
-      if (event.response.status !== 'completed') invalid('completed.response_status_mismatch', event);
-      if (event.response.error !== undefined && event.response.error !== null) throw providerFailure(event.response);
-      if (event.response.incomplete_details !== undefined && event.response.incomplete_details !== null) fail('RESPONSE_INCOMPLETE', 'completed.incomplete_details_present');
-      if (!Array.isArray(event.response.output)) invalid('completed.output_array_required', event);
-      const counts = { streamed_count: this.items.size, completed_count: event.response.output.length };
-      let finalOutput: unknown[] = event.response.output;
-      // Public streaming function calls can be assembled from their finished
-      // output_item.done items. When the terminal aggregate is empty, use only
-      // those complete items after normal response completion, never added items
-      // or partially accumulated arguments. Require every index in order.
-      if (finalOutput.length === 0 && this.items.size > 0) {
-        finalOutput = [];
-        for (let outputIndex = 0; outputIndex < this.items.size; outputIndex++) {
-          const location = { ...counts, output_index: outputIndex };
-          const state = this.items.get(outputIndex);
-          if (!state) invalid('completed.streamed_output_index_gap', location);
-          if (!state.done) invalid('completed.output_item_not_done', location);
-          finalOutput.push(state.done);
-        }
-      }
-      // The terminal Response contains the full native output array. It can
-      // supply items absent from the observed events, but cannot drop or change
-      // any item that this stream already started and completed.
-      for (const [outputIndex, state] of this.items) {
-        const location = { ...counts, output_index: outputIndex };
-        if (outputIndex >= finalOutput.length) invalid('completed.output_item_count_mismatch', location);
-        if (!state.done) invalid('completed.output_item_not_done', location);
-        if (!isDeepStrictEqual(state.done, finalOutput[outputIndex])) invalid('completed.output_item_done_mismatch', location);
-      }
-      const output: Record<string, unknown>[] = [], calls: Record<string, unknown>[] = [], ids = new Set<string>();
-      const itemIds = new Set<string>();
-      const chunks: StreamChunk[] = [];
-      for (let outputIndex = 0; outputIndex < finalOutput.length; outputIndex++) {
-        const raw = finalOutput[outputIndex];
-        if (!object(raw)) invalid('completed.output_item_object_required');
-        if (!identifier(raw.id)) invalid('completed.output_item_id_invalid');
-        if (!['message', 'reasoning', 'function_call'].includes(String(raw.type))) invalid('completed.output_item_type_unsupported');
-        if (itemIds.has(raw.id)) invalid('completed.output_item_id_duplicate');
-        itemIds.add(raw.id);
-        if (raw.status !== undefined && raw.status !== 'completed') invalid('completed.output_item_unfinished');
-        const state = this.items.get(outputIndex);
-        if (state && !state.done) invalid('completed.output_item_not_done');
-        if (state && state.item.id !== raw.id) invalid('completed.output_item_id_mismatch');
-        if (state && state.item.type !== raw.type) invalid('completed.output_item_type_mismatch');
-        // Complete reasoning comes from item.done, never item.added's potentially partial encrypted data.
-        const item = state?.done ?? raw;
-        if (raw.type === 'function_call') {
-          const call = functionItem(raw, this.allowedTools);
-          if (['id', 'type', 'call_id', 'namespace', 'name', 'arguments'].some(key => call[key] !== item[key]) || ids.has(String(call.call_id))) fail('INVALID_TOOL_CALL', 'completed.function_call_mismatch_or_duplicate');
-          ids.add(String(call.call_id)); calls.push(call);
-        } else if (raw.type === 'message') {
-          if (raw.status !== 'completed') invalid('completed.message_status_mismatch');
-          if (!Array.isArray(raw.content)) invalid('completed.message_content_array_required');
-          if (raw.role !== 'assistant') invalid('completed.message_role_mismatch');
-          for (let contentIndex = 0; contentIndex < raw.content.length; contentIndex++) {
-            const part = raw.content[contentIndex];
-            if (!object(part) || !['output_text', 'refusal'].includes(String(part.type))) fail('UNSUPPORTED_CONTENT', 'completed.content_part_type_unsupported');
-            const full = part.type === 'output_text' ? part.text : part.refusal;
-            if (typeof full !== 'string') invalid('completed.content_text_string_required');
-            const text = this.texts.get(`${outputIndex}:${contentIndex}`);
-            if (text && text.text !== full) invalid('completed.streamed_text_mismatch');
-            if (!text && full !== '') chunks.push(...this.text(outputIndex, contentIndex, String(raw.id), full));
-          }
-        } else if (raw.type === 'reasoning') {
-          if (!Array.isArray(raw.summary) || raw.summary.some(part => !object(part) || part.type !== 'summary_text' || typeof part.text !== 'string')) invalid('completed.reasoning_summary_invalid');
-          if (raw.content !== undefined && (!Array.isArray(raw.content) || raw.content.some(part => !object(part) || part.type !== 'reasoning_text' || typeof part.text !== 'string'))) invalid('completed.reasoning_content_invalid');
-          if (raw.encrypted_content !== undefined && raw.encrypted_content !== null && typeof raw.encrypted_content !== 'string') invalid('completed.reasoning_encrypted_content_invalid');
-        }
-        output.push(structuredClone(item));
-      }
-      for (const text of this.texts.values()) {
-        const raw = output[text.outputIndex];
-        if (!raw || raw.type !== 'message' || !Array.isArray(raw.content) || !raw.content[text.contentIndex]) invalid('completed.streamed_content_not_in_output');
-        text.closed = true; chunks.push({ type: 'block-end', index: text.index, block: { type: 'text', text: text.text } });
-      }
-      for (const call of calls) {
-        const index = this.nextIndex++, id = String(call.call_id) as ToolCallId;
-        const state = [...this.items.values()].find(state => state.item.call_id === id);
-        chunks.push({ type: 'block-start', index, blockType: 'tool-call' });
-        const fragments = state?.fragments.length ? state.fragments : [String(call.arguments)];
-        for (const [offset, fragment] of fragments.entries()) chunks.push({ type: 'tool-call-delta', index, id, ...(offset === 0 ? { name: String(call.name) } : {}), argumentsDelta: fragment });
-        chunks.push({ type: 'block-end', index, block: { type: 'tool-call', id, name: String(call.name), arguments: String(call.arguments) } });
-      }
-      if (this.nextIndex === 0) fail('EMPTY_RESPONSE', 'completed.no_visible_blocks');
-      const usage = mapUsage(event.response.usage); if (usage) chunks.push({ type: 'usage', usage });
-      this.completed = true;
-      const visible = chunks.filter(chunk => chunk.type === 'block-end').sort((a, b) => a.index - b.index).map(chunk =>
-        chunk.block.type === 'text' ? { type: 'text', text: chunk.block.text }
-          : chunk.block.type === 'tool-call' ? { type: 'tool-call', id: chunk.block.id, name: chunk.block.name, arguments: chunk.block.arguments } : { type: chunk.block.type });
-      chunks.push({ type: 'finish', reason: { kind: calls.length ? 'tool-calls' : 'stop' }, replayState: { response: { kind: 'siwc-responses', version: this.registrationId === undefined ? 1 : 2, ...(this.registrationId === undefined ? {} : { registrationId: this.registrationId }), model: this.model, output, visible } } });
-      return chunks;
-    } else if (!['response.created', 'response.in_progress', 'response.queued', 'response.content_part.added', 'response.content_part.done',
-      'response.output_text.done', 'response.refusal.done', 'response.reasoning_summary_part.added', 'response.reasoning_summary_part.done',
-      'response.reasoning_summary_text.delta', 'response.reasoning_summary_text.done', 'response.reasoning_text.delta', 'response.reasoning_text.done', 'response.output_text.annotation.added'].includes(event.type)) unsupportedEvent(event.type);
-    return [];
   }
 
-  end(): void { if (!this.completed) fail('STREAM_INTERRUPTED', 'stream.response_completed_missing'); }
+  private closeAll(chunks: StreamChunk[]): void {
+    const blocks = [...[...this.summaries.values()].map(block => ({ block, kind: 'reasoning' as const })), ...[...this.texts.values()].map(block => ({ block, kind: 'text' as const }))]
+      .sort((a, b) => a.block.index - b.block.index);
+    for (const { block, kind } of blocks) {
+      if (block.closed) continue;
+      block.closed = true;
+      chunks.push({ type: 'block-end', index: block.index, block: kind === 'text' ? { type: 'text', text: block.text } : { type: 'reasoning', text: block.text } });
+    }
+  }
+
+  private incomplete(event: Record<string, unknown>): StreamChunk[] {
+    const response = object(event.response) ? event.response : {};
+    const reason = object(response.incomplete_details) ? label(response.incomplete_details.reason, 60) : undefined;
+    this.notes.add(`stream.incomplete.${reason ?? 'unknown'}`);
+    if (reason !== 'max_output_tokens' || ![...this.texts.values()].some(block => block.text !== '')) {
+      throw new BridgeError(reason === 'content_filter' ? 'CONTENT_FILTERED' : 'RESPONSE_INCOMPLETE',
+        reason === 'content_filter' ? 'ChatGPTの安全上の判断で応答が途中で止まりました。' : `ChatGPTの応答が完了しませんでした（${reason ?? 'unknown'}）。`);
+    }
+    // A long answer that reached the output cap is kept; tool calls from it are never run.
+    const chunks: StreamChunk[] = [];
+    this.closeAll(chunks);
+    const usage = mapUsage(response.usage); if (usage) chunks.push({ type: 'usage', usage });
+    this.completed = true;
+    chunks.push({ type: 'finish', reason: { kind: 'max-tokens' } });
+    return chunks;
+  }
+
+  private complete(event: Record<string, unknown>): StreamChunk[] {
+    const response = object(event.response) ? event.response : {};
+    if (response.error !== undefined && response.error !== null) throw providerFailure(response);
+    const reported = Array.isArray(response.output) ? response.output.filter(object) : [];
+    // The final response is authoritative; when it is empty, finished stream items are used.
+    const output: Record<string, unknown>[] = reported.length > 0 ? reported.map(item => structuredClone(item))
+      : [...this.items.entries()].sort(([a], [b]) => a - b).flatMap(([, item]) => item.done ? [item.done] : []);
+    if (reported.length === 0 && this.items.size > 0) this.notes.add('stream.output_from_items');
+    const chunks: StreamChunk[] = [];
+    const calls: { id: string; name: string; arguments: string }[] = [];
+    const seen = new Set<string>();
+    for (const [outputIndex, item] of output.entries()) {
+      if (item.type === 'message' && Array.isArray(item.content)) {
+        for (const [contentIndex, part] of item.content.entries()) {
+          if (!object(part)) continue;
+          const full = part.type === 'output_text' ? part.text : part.type === 'refusal' ? part.refusal : undefined;
+          if (!text(full)) continue;
+          const key = `${outputIndex}:${contentIndex}`;
+          const streamed = this.texts.get(key);
+          if (!streamed) { if (full !== '') chunks.push(...this.append(this.texts, key, 'text', full)); }
+          // What the user already saw stays; a differing final text is only noted.
+          else if (streamed.text !== full) this.notes.add('stream.final_text_differs');
+        }
+      } else if (item.type === 'function_call') {
+        const id = text(item.call_id) && item.call_id !== '' ? item.call_id : undefined;
+        const name = text(item.name) && item.name !== '' ? item.name : undefined;
+        if (!id || !name) { this.notes.add('stream.call_without_id_or_name'); continue; }
+        if (seen.has(id)) { this.notes.add('stream.duplicate_call'); continue; }
+        seen.add(id);
+        const streamedArgs = [...this.items.values()].find(entry => entry.added.call_id === id)?.args;
+        const args = text(item.arguments) ? item.arguments : streamedArgs ?? '';
+        calls.push({ id, name, arguments: args === '' ? '{}' : args });
+      } else if (item.type === 'reasoning') {
+        // Summaries normally stream; when they did not, show the final summary once.
+        if (!this.summaries.has(`${outputIndex}`) && Array.isArray(item.summary)) {
+          const summary = item.summary.flatMap(part => object(part) && text(part.text) ? [part.text] : []).join('\n\n');
+          if (summary !== '') chunks.push(...this.append(this.summaries, `${outputIndex}`, 'reasoning', summary));
+        }
+      } else this.notes.add(`stream.skipped_item.${label(item.type, 40) ?? 'unknown'}`);
+    }
+    this.closeAll(chunks);
+    for (const call of calls) {
+      const index = this.nextIndex++;
+      chunks.push({ type: 'block-start', index, blockType: 'tool-call' });
+      chunks.push({ type: 'tool-call-delta', index, id: call.id as ToolCallId, name: call.name, argumentsDelta: call.arguments });
+      chunks.push({ type: 'block-end', index, block: { type: 'tool-call', id: call.id as ToolCallId, name: call.name, arguments: call.arguments } });
+    }
+    if (![...this.texts.values()].some(block => block.text !== '') && calls.length === 0) throw new BridgeError('EMPTY_RESPONSE', 'ChatGPTから空の応答が返りました。');
+    const usage = mapUsage(response.usage); if (usage) chunks.push({ type: 'usage', usage });
+    this.completed = true;
+    const ordered = [...this.texts.values()].map(block => ({ index: block.index, block: { type: 'text', text: block.text } as Record<string, unknown> }))
+      .concat(calls.map((call, offset) => ({ index: this.nextIndex - calls.length + offset, block: { type: 'tool-call', ...call } })))
+      .sort((a, b) => a.index - b.index).map(entry => entry.block);
+    chunks.push({ type: 'finish', reason: { kind: calls.length ? 'tool-calls' : 'stop' }, replayState: { response: {
+      kind: 'siwc-responses', version: this.registrationId === undefined ? 1 : 2,
+      ...(this.registrationId === undefined ? {} : { registrationId: this.registrationId }),
+      model: this.model, output: output.filter(item => REPLAY_TYPES.has(String(item.type))), visible: visibleOf(ordered) } } });
+    return chunks;
+  }
+
+  end(): void { if (!this.completed) throw new BridgeError('STREAM_INTERRUPTED', 'ChatGPTからの応答が完了前に途切れました。'); }
 }

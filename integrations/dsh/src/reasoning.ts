@@ -1,5 +1,4 @@
 import { ReasoningEffortId, type LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm';
-import { BridgeError } from './errors.js';
 
 type Effort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -38,12 +37,23 @@ export function reasoningForModel(model: string): LlmResolvedModelInfo['reasonin
   };
 }
 
-/** Validate explicit controls before transport and map them to public Responses syntax. */
-export function reasoningRequest(model: string, effort: unknown): { effort: string } | undefined {
-  if (effort === undefined) return undefined;
+/**
+ * Responses `reasoning` for a documented reasoning model: a readable summary is
+ * always requested; the chosen effort is added when the model lists it, and an
+ * effort it does not list is left to the provider default.
+ */
+export function reasoningRequest(model: string, effort: unknown): { effort?: string; summary: 'auto' } | undefined {
   const efforts = MODEL_EFFORTS.get(model);
-  if (typeof effort !== 'string' || efforts === undefined || !efforts.some(candidate => candidate === effort)) {
-    throw new BridgeError('UNSUPPORTED_OPTION', '選択したモデルで対応を確認できない推論の度合いです。モデルと推論設定を選び直してください。');
-  }
-  return { effort };
+  if (efforts === undefined) return undefined;
+  return typeof effort === 'string' && efforts.some(candidate => candidate === effort) ? { effort, summary: 'auto' } : { summary: 'auto' };
+}
+
+/**
+ * Documented capacity of the exact model IDs above (same official pages, 2026-10-11):
+ * 1,050,000-token context window, 128,000 max output, text and image input.
+ * DSH uses the context size to compact long sessions before they overflow.
+ */
+const CONTEXT_WINDOW = 1_050_000;
+export function contextForModel(model: string): { contextWindow: number } | undefined {
+  return MODEL_EFFORTS.has(model) ? { contextWindow: CONTEXT_WINDOW } : undefined;
 }

@@ -1,34 +1,37 @@
 import { AuthManager, type AuthStatus } from './auth.js';
 import { SiwcAdapter, type AdapterOptions } from './adapter.js';
-import { diskCatalogStore } from './local-cache.js';
-import { recordRequest, verificationStatus, stopInference, usageState } from './ledger.js';
-import { BridgeError } from './errors.js';
+import { diskCatalogStore, applicationDirectory } from './local-cache.js';
+import { diskDiagnostics, type Diagnostics } from './diagnostics.js';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
-import { join, isAbsolute } from 'node:path';
+import { join } from 'node:path';
 
 export const MANAGE_USAGE = 'https://chatgpt.com/settings/usage';
-/** Shown at the first-use confirmation, which also starts ordinary use. */
-export const CREDIT_NOTICE = `【課金の注意】プラン枠を使い切った後にクレジットを使う設定の場合、追加料金がかかることがあります。${MANAGE_USAGE} の App limits で「SIWC Bridge for DSH」の週間上限を100%未満にするか、クレジット利用をOFFにしてください。自動購入OFFだけでは既存クレジットの消費は防げません。`;
-export function startMessage(result: 'started' | 'already' | 'stopped' | 'verification'): string {
-  return result === 'started' ? '通常の個人利用を開始しました。'
-    : result === 'already' ? '通常の個人利用を開始済みです。'
-    : result === 'stopped' ? '利用上限のエラーで停止中です。公式Usageを確認してから resume で再開してください。'
-    : 'ライブ検証の実行中です。終了する場合は finish-verification を実行してください。';
+/** SIWC UI guideline: shown once, after the first sign-in with ChatGPT plan usage enabled. */
+export const WELCOME = `You're using your ChatGPT plan — このアプリからのAI要求は、あなたのChatGPTプランの利用枠を使います。利用状況と上限はChatGPTの設定で管理できます（Manage usage: ${MANAGE_USAGE}）。`;
+/** Billing caution shown with the welcome and in the README. */
+export const CREDIT_NOTICE = `【課金の注意】プラン枠を使い切った後にクレジットを使う設定の場合、追加料金がかかることがあります。${MANAGE_USAGE} の App limits で「SIWC Bridge for DSH」の週間上限を100%未満にするか、クレジット利用をOFFにしてください。`;
+export const PRIVACY_NOTICE = 'ChatGPTの公式画面でサインインと利用許可を行います。許可した登録情報はこのWindowsユーザーだけが読めるよう暗号化（DPAPI）して保存し、会話・ツール定義・ツール結果をOpenAIの公開APIへ送ります。パスワードやトークンをチャットに入力しないでください。';
+
+export function createServices(media: Pick<AdapterOptions, 'attachments' | 'imageAccess'> = {}, diagnostics: Diagnostics = diskDiagnostics()) {
+  const auth = new AuthManager();
+  const adapter = new SiwcAdapter(auth, { catalogStore: diskCatalogStore(), diagnostics, ...media });
+  return { auth, adapter, diagnostics };
 }
-export const PRIVACY_NOTICE = 'この個人開発プラグインは、本人が許可したChatGPT登録情報をWindowsのCurrentUser DPAPIで保護してローカルに保存し、選択した会話履歴とdshのツール定義・結果をOpenAIの公開APIへ送信します。既存のChatGPT会話を取得しません。追加料金は本人のクレジット設定に従うため、ChatGPTのManage usageで確認してください。パスワード・Cookie・トークンをチャットへ入力しないでください。';
-export function createServices(media: Pick<AdapterOptions, 'attachments' | 'imageAccess'> = {}) {
-  const auth = new AuthManager(recordRequest);
-  const adapter = new SiwcAdapter(auth, { beforeRequest: (kind, signal) => recordRequest(kind, signal), onUsageLimit: stopInference, usageState },
-    { catalogStore: diskCatalogStore(), ...media });
-  return { auth, adapter };
+
+/** Sign in, then show the first-use welcome once (the plan confirmation is recorded with it). */
+export async function signIn(auth: AuthManager, options: { registrationId?: string; forceConsent?: boolean; signal?: AbortSignal }): Promise<string> {
+  const before = await auth.status();
+  const wasConfirmed = before.registrations.find(row => row.id === (options.registrationId ?? before.activeId))?.planConfirmed === true;
+  const after = await auth.login(options);
+  const active = after.registrations.find(row => row.active);
+  if (!active?.planAllowed) return 'サインインしましたが、ChatGPTプランの利用が許可されていません。/siwc login をもう一度実行し、許可画面で利用を許可してください。';
+  if (!active.planConfirmed) await auth.confirmPlan();
+  return [wasConfirmed ? 'サインインしました。' : WELCOME, ...(wasConfirmed ? [] : [CREDIT_NOTICE]), 'モデルは入力欄のモデル選択から「ChatGPT plan (SIWC)」のモデルを選んでください。登録を切り替えた場合は新しい会話を始めてください。'].join('\n');
 }
-function selectionFile(): string {
-  const local = process.env.LOCALAPPDATA;
-  if (!local || !isAbsolute(local)) throw new BridgeError('LOCAL_STATE_UNAVAILABLE', 'ローカル設定領域がありません。');
-  return join(local, 'siwc-bridge-dsh', 'selected-model.json');
-}
-export async function saveModel(auth: AuthManager, adapter: SiwcAdapter, slug: string): Promise<void> {
-  await adapter.resolveModel('siwc', slug);
+
+function selectionFile(): string { return join(applicationDirectory(), 'selected-model.json'); }
+/** The model a new DSH start uses by default; choosing a model in the DSH selector works without it. */
+export async function saveModel(auth: AuthManager, slug: string): Promise<void> {
   const status = await auth.status();
   const file = selectionFile();
   await mkdir(join(file, '..'), { recursive: true });
@@ -39,12 +42,16 @@ export async function selectedModel(auth: AuthManager): Promise<string | undefin
     const row = JSON.parse(await readFile(selectionFile(), 'utf8')) as { model?: unknown; registrationId?: unknown };
     if (typeof row.model !== 'string' || row.registrationId !== (await auth.status()).activeId) return undefined;
     return row.model;
-  } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw new BridgeError('MODEL_SELECTION_INVALID', 'モデル選択記録を確認できません。'); }
+  } catch { return undefined; }
 }
-export function formatStatus(status: AuthStatus, model: string | undefined, limited: boolean): string {
-  const rows = status.registrations.map(r => `${r.active ? '*' : ' '} ${r.id} ${r.label}: ${r.authenticated ? '認証済み' : '再認証が必要'} / ${r.planAllowed ? 'プラン利用許可済み' : 'プラン利用許可なし'} / ${r.planConfirmed ? '初回確認済み' : '初回利用確認が必要'}`);
-  return ['ChatGPT plan (SIWC)', ...rows, `モデル: ${model ?? '未選択'}`, `利用上限: ${limited ? '新規推論停止。Manage usageを確認' : '未検出（残量は未確認）'}`, `Manage usage: ${MANAGE_USAGE}`].join('\n');
+
+export function formatStatus(status: AuthStatus, model: string | undefined, paused: boolean, diagnostics: string): string {
+  const rows = status.registrations.map(r => `${r.active ? '*' : ' '} ${r.id} ${r.label}: ${r.authenticated ? 'サインイン済み' : 'サインインが必要（/siwc login ' + r.id + '）'}${r.authenticated && !r.planAllowed ? ' / プラン利用が未許可' : ''}`);
+  return ['ChatGPT plan (SIWC) — Using ChatGPT plan', ...(rows.length ? rows : ['未サインイン: /siwc login で始めてください。']),
+    `既定モデル: ${model ?? '未設定（入力欄のモデル選択で選べます）'}`,
+    `利用上限: ${paused ? '上限に達したため停止中。確認後 /siwc resume' : '問題は検出していません（残量はChatGPTの設定で確認）'}`,
+    `Manage usage: ${MANAGE_USAGE}`, `診断ログ: ${diagnostics}`].join('\n');
 }
-export async function statusText(auth: AuthManager, adapter: SiwcAdapter): Promise<string> {
-  return formatStatus(await auth.status(), await selectedModel(auth), await adapter.usageLimited()) + '\n要求件数: ' + JSON.stringify(await verificationStatus());
+export async function statusText(auth: AuthManager, adapter: SiwcAdapter, diagnostics: Diagnostics): Promise<string> {
+  return formatStatus(await auth.status(), await selectedModel(auth), adapter.isPaused(), diagnostics.location);
 }

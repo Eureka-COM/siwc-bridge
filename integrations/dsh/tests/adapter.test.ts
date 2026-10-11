@@ -1,201 +1,162 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SiwcAdapter } from '../lib/adapter.js';
+import { BlockAssembler, IMAGE_OFFLOAD_REQUIRED_CODE, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
+import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
+import { SiwcAdapter, IMAGE_POLICY, requestImageSize } from '../lib/adapter.js';
 import { safeFailure } from '../lib/errors.js';
-import { mkdtemp } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { testLedger } from '../lib/ledger.js';
-import { createAuthTestHarness } from '../lib/auth.js';
-import { BlockAssembler } from '@deepseek-ai/dsh-llm';
-import type { GenerateOptions } from '@deepseek-ai/dsh-llm';
+import type { Diagnostics } from '../lib/diagnostics.js';
 
-test('persisted DSH native history is registration-bound across adapter restarts and model changes', async () => {
-  const original = globalThis.fetch;
-  let activeId = 'registration-a', requests = 0;
-  let sent: any;
-  const model = 'fixture-replay';
-  const credentials = { status: async () => ({ activeId }), withAccessToken: async (operation: any) => operation('synthetic-test-only', undefined, activeId) };
-  const create = () => new SiwcAdapter(credentials);
-  const base: GenerateOptions = { provider: 'siwc', model, messages: [{ role: 'user', content: [{ type: 'text', text: 'fixture' }] }] };
-  const collect = async (adapter: SiwcAdapter, options: GenerateOptions) => {
-    const assembler = new BlockAssembler(); for await (const chunk of adapter.stream(options)) assembler.push(chunk); return assembler;
-  };
-  try {
-    globalThis.fetch = async (url, init) => {
-      requests++;
-      if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [model, 'other-model'].map(slug => ({ slug, display_name: slug, visibility: 'list' })) });
-      sent = JSON.parse(String(init?.body));
-      const output = [{ type: 'reasoning', id: 'rs_fixture', summary: [], encrypted_content: 'opaque-account-a-fixture' },
-        { type: 'message', id: 'msg_fixture', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'fixture answer' }] }];
-      return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: { status: 'completed', output } })}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
-    };
-    const first = await collect(create(), base);
-    const assistant = first.message({ provider: 'siwc', model, replayState: first.replayState });
-    base.messages.push(assistant, { role: 'user', content: [{ type: 'text', text: 'continue' }] });
-    await collect(create(), base); // Same persisted registration, reconstructed adapter.
-    assert.ok(sent.input.some((item: any) => item.encrypted_content === 'opaque-account-a-fixture'));
-    for (const targetModel of [model, 'other-model']) {
-      activeId = 'registration-b'; const count = requests;
-      await assert.rejects(collect(create(), { ...base, model: targetModel }), (e: any) => e.providerCode === 'INVALID_REPLAY_CONTEXT');
-      assert.equal(requests, count);
-    }
-    activeId = 'registration-a';
-    const legacy = structuredClone(base); delete (legacy.messages[1] as any).source.replayState.response.registrationId;
-    const count = requests;
-    await assert.rejects(collect(create(), legacy), (e: any) => e.providerCode === 'INVALID_REPLAY_CONTEXT'); assert.equal(requests, count);
-    await collect(create(), { ...base, model: 'other-model' }); // Same-account model switch remains valid.
-    assert.equal(sent.input.some((item: any) => item.type === 'reasoning'), false);
-    activeId = 'registration-b'; await collect(create(), { ...base, messages: [base.messages[0]] }); // New conversation is allowed.
-  } finally { globalThis.fetch = original; }
+const model = 'gpt-6.1-sol';
+const user = (text: string) => ({ role: 'user' as const, content: [{ type: 'text' as const, text }] });
+const options = (extra: Partial<GenerateOptions> = {}): GenerateOptions => ({ provider: 'siwc', model, messages: [user('secret prompt text')], ...extra });
+const sse = (...events: unknown[]) => new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream', 'x-request-id': 'req_ok' } });
+const answer = (text = 'ok') => sse({ type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: text },
+  { type: 'response.completed', response: { status: 'completed', output: [{ type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }] } });
+function credentials(registration = { value: 'reg-a' }) {
+  return { status: async () => ({ activeId: registration.value, registrations: [{ id: registration.value, authenticated: true, planAllowed: true, planConfirmed: true }] }),
+    withAccessToken: async (operation: any) => operation('synthetic-test-only', undefined, registration.value) };
+}
+function memoryDiagnostics(): Diagnostics & { lines: string[] } {
+  const lines: string[] = [];
+  return { lines, location: 'memory', record(fields) { lines.push(Object.entries(fields).filter(([, v]) => v !== undefined).map(([k, v]) => `${k}=${v}`).join(' ')); }, async tail() { return lines; } };
+}
+async function run(adapter: SiwcAdapter, request: GenerateOptions): Promise<StreamChunk[]> { const chunks: StreamChunk[] = []; for await (const chunk of adapter.stream(request)) chunks.push(chunk); return chunks; }
+function mockFetch(t: test.TestContext, handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
+  const calls: { url: string; body?: any }[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string, init?: RequestInit) => { calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined }); return handler(url, init); });
+  return calls;
+}
+
+test('a turn streams through, with the token’s own registration in its replay state and a label-only diagnostics line', async t => {
+  const calls = mockFetch(t, () => answer('hello'));
+  const diagnostics = memoryDiagnostics();
+  const chunks = await run(new SiwcAdapter(credentials(), { diagnostics }), options({ reasoningEffort: ReasoningEffortId('high') }));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.body.store, false); assert.deepEqual(calls[0]!.body.reasoning, { effort: 'high', summary: 'auto' });
+  const finish = chunks.at(-1) as any;
+  assert.equal(finish.reason.kind, 'stop'); assert.equal(finish.replayState.response.registrationId, 'reg-a');
+  assert.equal(diagnostics.lines.length, 1);
+  assert.match(diagnostics.lines[0]!, /kind=inference model=gpt-6.1-sol outcome=ok http=200 request_id=req_ok/);
+  assert.equal(diagnostics.lines[0]!.includes('secret prompt text'), false);
 });
 
-test('registration bound to the acquired token is checked before inference, even if status is stale', async () => {
-  const original = globalThis.fetch; let inference = 0;
-  try {
-    globalThis.fetch = async url => {
-      if (url === 'https://api.openai.com/v1/responses') inference++;
-      return Response.json({ models: [{ slug: 'fixture', display_name: 'Fixture', visibility: 'list' }] });
-    };
-    const adapter = new SiwcAdapter({ status: async () => ({ activeId: 'registration-a' }), withAccessToken: async operation => operation('synthetic-test-only', undefined, 'registration-b') });
-    await assert.rejects(async () => { for await (const _ of adapter.stream({ provider: 'siwc', model: 'fixture', messages: [] })) {} }, (e: any) => e.providerCode === 'INVALID_REPLAY_CONTEXT');
-    assert.equal(inference, 0);
-  } finally { globalThis.fetch = original; }
+test('history is built for the registration of the token actually used, so another account’s reasoning is never sent', async t => {
+  const registration = { value: 'reg-a' };
+  const calls = mockFetch(t, () => sse({ type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'rs_1' } },
+    { type: 'response.output_text.delta', output_index: 1, content_index: 0, delta: 'first' },
+    { type: 'response.completed', response: { status: 'completed', output: [{ type: 'reasoning', id: 'rs_1', summary: [], encrypted_content: 'opaque-a' },
+      { type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'first' }] }] } }));
+  const adapter = new SiwcAdapter(credentials(registration));
+  const assembler = new BlockAssembler(); let state;
+  for (const chunk of await run(adapter, options())) { assembler.push(chunk); if (chunk.type === 'finish') state = chunk.replayState; }
+  const history = options({ messages: [user('q'), assembler.message({ provider: 'siwc', model, replayState: state }), user('next')] });
+  await run(adapter, history);
+  assert.ok(calls[1]!.body.input.some((item: any) => item.encrypted_content === 'opaque-a'));
+  registration.value = 'reg-b';
+  await run(adapter, history);
+  assert.equal(calls[2]!.body.input.some((item: any) => item.type === 'reasoning'), false);
+  assert.ok(calls[2]!.body.input.some((item: any) => item.role === 'assistant' && item.content === 'first'));
 });
 
-test('registration change before completed response releases no terminal tool or replay state', async () => {
-  const original = globalThis.fetch; let activeId = 'registration-a'; const chunks: any[] = [];
-  try {
-    globalThis.fetch = async url => {
-      if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: 'fixture', display_name: 'Fixture', visibility: 'list' }] });
-      const output = [{ type: 'function_call', id: 'fc_fixture', call_id: 'call_fixture', namespace: 'dsh', name: 'read_dummy', arguments: '{}', status: 'completed' }];
-      let sent = false;
-      const body = new ReadableStream<Uint8Array>({ pull(controller) {
-        if (sent) { controller.close(); return; } sent = true; activeId = 'registration-b';
-        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'response.completed', response: { status: 'completed', output } })}\n\n`));
-      } }, { highWaterMark: 0 });
-      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
-    };
-    const adapter = new SiwcAdapter({ status: async () => ({ activeId }), withAccessToken: async operation => operation('synthetic-test-only', undefined, activeId) });
-    await assert.rejects(async () => { for await (const chunk of adapter.stream({ provider: 'siwc', model: 'fixture', messages: [], tools: [{ name: 'read_dummy', parameters: {} }] })) chunks.push(chunk); }, (e: any) => e.providerCode === 'INVALID_REPLAY_CONTEXT');
-    assert.deepEqual(chunks, []);
-  } finally { globalThis.fetch = original; }
+test('usage limit pauses new requests without sending them until /siwc resume; other service errors stay retryable', async t => {
+  let mode = 'limit';
+  const calls = mockFetch(t, () => mode === 'limit'
+    ? Response.json({ error: { code: 'subscription_sharing_usage_limit_exceeded', message: 'SECRET_ECHO' } }, { status: 429, headers: { 'x-request-id': 'req_limit' } })
+    : mode === 'unavailable' ? Response.json({ error: { code: 'subscription_sharing_usage_unavailable' } }, { status: 503 }) : answer());
+  const adapter = new SiwcAdapter(credentials());
+  await assert.rejects(run(adapter, options()), (error: any) => {
+    assert.equal(error.code, 'QUOTA'); assert.match(error.message, /Manage usage/); assert.match(error.message, /request_id=req_limit/);
+    assert.equal(safeFailure(error).includes('SECRET_ECHO'), false); return true;
+  });
+  assert.equal(adapter.isPaused(), true);
+  await assert.rejects(run(adapter, options()), (error: any) => error.code === 'QUOTA' && /\/siwc resume/.test(error.message));
+  assert.equal(calls.length, 1, 'paused requests are not sent');
+  adapter.resume(); mode = 'unavailable';
+  await assert.rejects(run(adapter, options()), { code: 'SERVER' });
+  assert.equal(adapter.isPaused(), false);
+  mode = 'ok'; await run(adapter, options());
+  assert.equal(calls.length, 3);
+  const policy = adapter.providerRetryPolicy('siwc');
+  assert.equal(policy.mode, 'normal');
+  if (policy.mode === 'normal') { assert.equal(policy.maxRetries, 4); for (const code of ['TRANSPORT', 'SERVER', 'RATE_LIMIT', 'TIMEOUT', 'EMPTY_RESPONSE']) assert.ok(policy.retryableCodes.includes(code), code); assert.equal(policy.retryableCodes.includes('QUOTA'), false); }
 });
 
-test('an unregistered credential source cannot replay opaque history after switching its token', async () => {
-  const original = globalThis.fetch; let currentToken = 'synthetic-account-a', requests = 0;
-  try {
-    globalThis.fetch = async url => {
-      requests++;
-      if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: 'fixture', display_name: 'Fixture', visibility: 'list' }] });
-      const output = [{ type: 'reasoning', id: 'rs_fixture', summary: [], encrypted_content: 'opaque-account-a-fixture' },
-        { type: 'message', id: 'msg_fixture', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'fixture answer' }] }];
-      return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: { status: 'completed', output } })}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
-    };
-    const adapter = new SiwcAdapter({ withAccessToken: async operation => operation(currentToken) });
-    const options: GenerateOptions = { provider: 'siwc', model: 'fixture', messages: [] };
-    const assembler = new BlockAssembler(); for await (const chunk of adapter.stream(options)) assembler.push(chunk);
-    options.messages.push(assembler.message({ provider: 'siwc', model: 'fixture', replayState: assembler.replayState }));
-    currentToken = 'synthetic-account-b'; const before = requests;
-    await assert.rejects(async () => { for await (const _ of adapter.stream(options)) {} }, (e: any) => e.providerCode === 'INVALID_REPLAY_CONTEXT');
-    assert.equal(requests, before);
-  } finally { globalThis.fetch = original; }
+test('HTTP and transport failures map to DSH routing codes', async t => {
+  let response: () => Response | Promise<Response> = () => answer();
+  mockFetch(t, () => response());
+  const adapter = () => new SiwcAdapter(credentials());
+  for (const [status, body, code] of [[401, { error: { code: 'subscription_sharing_invalid_user' } }, 'AUTH'], [403, { error: { code: 'subscription_sharing_user_not_eligible' } }, 'FORBIDDEN'],
+    [429, { error: { code: 'rate_limit_exceeded' } }, 'RATE_LIMIT'], [500, {}, 'SERVER'], [400, { error: { code: 'subscription_sharing_unsupported_capability', param: 'tools' } }, 'UNSUPPORTED_OPTION'],
+    [400, { error: { code: 'context_length_exceeded' } }, 'CONTEXT_WINDOW_EXCEEDED']] as const) {
+    response = () => Response.json(body, { status });
+    await assert.rejects(run(adapter(), options()), (error: any) => error.code === code, `${status} → ${code}`);
+  }
+  response = () => { throw new TypeError('fetch failed'); };
+  await assert.rejects(run(adapter(), options()), { code: 'TRANSPORT' });
+  response = () => new Response('data: {"type":"response.output_text.delta","output_index":0,"delta":"partial"}\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  await assert.rejects(run(adapter(), options()), { code: 'TRANSPORT' });
 });
 
-test('caller cancellation settles registration lookup while another credential transaction holds the lock', async () => {
-  const now = Date.now(); let release!: () => void, entered!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; }), held = new Promise<void>(resolve => { entered = resolve; });
-  const auth = createAuthTestHarness({ seed: { version: 1, hostId: 'urn:uuid:11111111-1111-4111-8111-111111111111', activeId: 'fixture', registrations: [{
-    id: 'fixture', label: 'Fixture', clientId: 'oaiapp_fixture', subject: 'fixture-subject', issuer: 'https://auth.openai.com', planConfirmed: true,
-    credentials: { accessToken: 'fake-access-never-real', scopes: ['openid', 'resource.invoke', 'chatgpt.tokens.use.direct'], expiresAt: now + 3600000, savedAt: new Date(now).toISOString() },
-  }] }, now: () => now, openBrowser: async () => {}, transport: async () => { throw new Error('No HTTP expected'); } });
-  const holder = auth.withAccessToken(async () => { entered(); await gate; }); await held;
-  const adapter = new SiwcAdapter(auth), abort = new AbortController();
-  const pending = (async () => { for await (const _ of adapter.stream({ provider: 'siwc', model: 'fixture', messages: [], signal: abort.signal })) {} })();
-  const settled = pending.then(() => 'COMPLETED', (e: any) => e.code);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await new Promise(resolve => setTimeout(resolve, 10)); abort.abort();
-    assert.equal(await Promise.race([settled, new Promise(resolve => { timer = setTimeout(() => resolve('STILL_WAITING'), 150); })]), 'ABORTED');
-  } finally { clearTimeout(timer); release(); await holder; await settled; }
+test('a stalled stream is abandoned as a retryable TIMEOUT; caller cancellation is ABORTED', async t => {
+  mockFetch(t, () => new Response(new ReadableStream({ pull() { return new Promise(() => {}); } }), { headers: { 'content-type': 'text/event-stream' } }));
+  await assert.rejects(run(new SiwcAdapter(credentials(), { idleTimeoutMs: 50 }), options()), { code: 'TIMEOUT' });
+  const controller = new AbortController();
+  const pending = run(new SiwcAdapter(credentials()), options({ signal: controller.signal }));
+  setTimeout(() => controller.abort(), 20);
+  await assert.rejects(pending, { code: 'ABORTED' });
 });
 
-test('usage limit/unavailable stops the shared ledger across adapter restarts', async () => {
-  const original = globalThis.fetch;
-  const directory = await mkdtemp(join(tmpdir(), 'siwc-dsh-quota-'));
-  let inference = 0;
-  const options = { provider: 'siwc', model: 'fixture', messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'fixture' }] }] };
-  const collect = async (adapter: SiwcAdapter) => { for await (const _ of adapter.stream(options)) {} };
-  try {
-    for (const [index, code] of ['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable'].entries()) {
-      const ledger = testLedger(join(directory, `${index}.json`)); await ledger.arm(); await ledger.finish();
-      const create = () => new SiwcAdapter({ withAccessToken: operation => operation('synthetic-test-only') }, {
-        beforeRequest: (kind, signal) => ledger.request(kind, signal), onUsageLimit: () => ledger.stop(),
-      });
-      globalThis.fetch = async url => {
-        if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: 'fixture', display_name: 'Fixture', visibility: 'list' }] });
-        assert.equal(url, 'https://api.openai.com/v1/responses'); inference++;
-        return Response.json({ error: { code } }, { status: 429 });
-      };
-      await assert.rejects(collect(create()), { code: 'QUOTA' });
-      const count = inference;
-      assert.equal((await ledger.status()).armed, false); assert.equal((await ledger.status()).personalUse, false);
-      await assert.rejects(collect(create()), { code: 'LIVE_NOT_STARTED' }); assert.equal(inference, count);
-      await assert.rejects(ledger.finish(), { code: 'LIVE_NOT_STARTED' });
-      await ledger.arm(); await assert.rejects(collect(create()), { code: 'QUOTA' }); assert.equal(inference, count + 1);
-    }
-  } finally { globalThis.fetch = original; }
+test('catalog: unshowable entries are skipped, the rest stays usable; models outside the catalog are still allowed', async t => {
+  mockFetch(t, url => { assert.equal(url, 'https://api.openai.com/v1/models'); return Response.json({ models: [{ slug: model, display_name: 'GPT-6.1 Sol', visibility: 'list' }, { slug: 'hidden', visibility: 'hide' }, { bad: true }, { slug: 'no-name', visibility: 'list' }] }); });
+  const adapter = new SiwcAdapter(credentials());
+  const models = await adapter.listModels('siwc');
+  assert.deepEqual(models.map(entry => [entry.id, entry.name]), [[model, 'GPT-6.1 Sol'], ['no-name', 'no-name']]);
+  assert.deepEqual(models[0]!.inputModalities, ['text', 'image']);
+  const known = await adapter.resolveModel('siwc', model);
+  assert.equal(known.context?.contextWindow, 1_050_000);
+  assert.deepEqual(known.reasoning?.efforts.map(effort => String(effort.id)), ['low', 'medium', 'high', 'xhigh', 'max']);
+  const unknown = await adapter.resolveModel('siwc', 'future-model');
+  assert.equal(unknown.id, 'future-model'); assert.equal(unknown.context, undefined); assert.equal(unknown.reasoning, undefined);
 });
 
-test('dshのserialized failureとコマンド診断にsafeなnative code/param/request IDを残す', async () => {
-  const original = globalThis.fetch;
-  try {
-    for (const status of [401, 403, 429, 503]) {
-      globalThis.fetch = async url => {
-        assert.equal(url, 'https://api.openai.com/v1/models');
-        return new Response(JSON.stringify({ error: { code: 'subscription_sharing_user_not_eligible', param: 'workspace', message: 'FAKE_SECRET_ECHO' } }),
-          { status, headers: { 'x-request-id': 'req_fixture' } });
-      };
-      const adapter = new SiwcAdapter({ withAccessToken: operation => operation('synthetic-test-only') });
-      await assert.rejects(adapter.listModels('siwc'), (error: any) => {
-        const saved = JSON.parse(JSON.stringify(error.failure));
-        assert.equal(saved.status, status); assert.equal(saved.requestId, 'req_fixture');
-        assert.match(saved.message, /provider_code=subscription_sharing_user_not_eligible/);
-        assert.match(saved.message, /param=workspace/); assert.match(saved.message, /shape=structured_error/);
-        assert.match(safeFailure(error), /req_fixture/);
-        assert.equal(saved.message.includes('FAKE_SECRET_ECHO'), false);
-        assert.equal(safeFailure(error).includes('FAKE_SECRET_ECHO'), false);
-        return true;
-      });
-    }
-  } finally { globalThis.fetch = original; }
+// ---------- attachments ----------
+
+const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+const ref = (id: string) => ({ attachmentId: id, mediaType: 'image/png', bytes: PNG.byteLength, width: 4000, height: 3000, name: `${id}.png` });
+function images(bytes = PNG.byteLength) {
+  const reads: unknown[] = [];
+  return { reads, service: { async readImageRequest(image: any, target: any) { reads.push(target); return { variantId: 'v', attachment: image, data: PNG, mediaType: 'image/png', bytes, width: target.width, height: target.height, depth: 'uchar', space: 'srgb', hasAlpha: false }; } } };
+}
+
+test('images are sent as input_image with DSH’s handle text, within DSH’s pixel and byte budget', async t => {
+  const calls = mockFetch(t, () => answer());
+  const { reads, service } = images();
+  await run(new SiwcAdapter(credentials(), { attachments: () => service as any, imageAccess: () => ({ readonlyPath: '/fixture/a.png' }) }),
+    options({ messages: [{ role: 'user', content: [{ type: 'text', text: 'what is this?' }, { type: 'image', attachment: ref('img-a') }] }] } as any));
+  assert.deepEqual(reads, [{ ...requestImageSize(4000, 3000, IMAGE_POLICY.maxPixels), maxBytes: IMAGE_POLICY.maxBytes }]);
+  const content = calls[0]!.body.input.find((item: any) => item.role === 'user').content;
+  assert.deepEqual(content.map((part: any) => part.type), ['input_text', 'input_text', 'input_image']);
+  assert.equal(content[2].image_url, `data:image/png;base64,${Buffer.from(PNG).toString('base64')}`);
 });
 
-test('HTTP headers後にauth scopeが中断したstreamはcompleted toolを実行へ渡さない', async () => {
-  const original = globalThis.fetch; const cancelled = new AbortController();
-  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
-  let fetched!: () => void; const headersReceived = new Promise<void>(resolve => { fetched = resolve; });
-  let releasedScopes = 0; let tools = 0; let streamCancelled = 0;
-  try {
-    globalThis.fetch = async url => {
-      if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: 'fixture-model', display_name: 'Fixture', visibility: 'list' }] });
-      assert.equal(url, 'https://api.openai.com/v1/responses');
-      const body = new ReadableStream<Uint8Array>({ start(c) { streamController = c; }, cancel() { streamCancelled++; } });
-      fetched(); return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
-    };
-    const adapter = new SiwcAdapter({
-      withAccessToken: operation => operation('synthetic-test-only'),
-      openRequestScope: async () => ({ signal: cancelled.signal, close() { releasedScopes++; } }),
-    });
-    const pending = (async () => {
-      for await (const chunk of adapter.stream({ provider: 'siwc', model: 'fixture-model', messages: [{ role: 'user', content: [{ type: 'text', text: 'fixture' }] }], tools: [] })) {
-        if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') tools++;
-      }
-    })();
-    await headersReceived; cancelled.abort();
-    await assert.rejects(pending, { code: 'ABORTED' });
-    // One request scope: inference no longer re-fetches the model catalog first.
-    assert.equal(tools, 0); assert.equal(streamCancelled, 1); assert.equal(releasedScopes, 1);
-    assert.throws(() => streamController!.enqueue(new TextEncoder().encode('data: {"type":"response.completed"}\n\n')));
-  } finally { globalThis.fetch = original; }
+test('an image that cannot be loaded, or a missing attachment service, still sends the turn with a visible note', async t => {
+  const calls = mockFetch(t, () => answer());
+  const request = options({ messages: [{ role: 'user', content: [{ type: 'text', text: 'see' }, { type: 'image', attachment: ref('img-x') }] }] } as any);
+  await run(new SiwcAdapter(credentials()), request);
+  await run(new SiwcAdapter(credentials(), { attachments: () => ({ async readImageRequest() { throw new Error('gone'); } }) as any }), request);
+  for (const call of calls) assert.match(JSON.stringify(call.body.input), /could not be loaded/);
+});
+
+test('too many image bytes ask DSH to offload old images before anything is sent; tool results can carry images', async t => {
+  const calls = mockFetch(t, () => answer());
+  const big = images(1_200_000);
+  const many = options({ messages: [{ role: 'user', content: Array.from({ length: 16 }, (_, i) => ({ type: 'image', attachment: ref(`img-${i}`) })) }] } as any);
+  await assert.rejects(run(new SiwcAdapter(credentials(), { attachments: () => big.service as any }), many), (error: any) => error.code === IMAGE_OFFLOAD_REQUIRED_CODE && error.failure.offloadImages > 0);
+  assert.equal(calls.length, 0);
+  const { service } = images();
+  await run(new SiwcAdapter(credentials(), { attachments: () => service as any }), options({ messages: [user('read the screenshot'),
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }], source: { provider: 'siwc', model } },
+    { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'screenshot' }, { type: 'image', attachment: ref('img-t') }] }] } as any));
+  const output = calls[0]!.body.input.find((item: any) => item.type === 'function_call_output').output;
+  assert.ok(Array.isArray(output) && output.some((part: any) => part.type === 'input_image'));
 });
