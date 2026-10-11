@@ -3,8 +3,16 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { readText, MAX_JSON_BYTES } from '../lib/http.js';
 
-test('SDK and standalone DSH share byte-identical bounded JSON reader source', async () => {
-  assert.deepEqual(await readFile(new URL('../src/http.ts', import.meta.url)), await readFile(new URL('../integrations/dsh/src/http.ts', import.meta.url)));
+test('the DSH integration builds its JSON reader, auth, storage and errors from the SDK sources only', async () => {
+  const sync = await readFile(new URL('../integrations/dsh/scripts/sync-core.mjs', import.meta.url), 'utf8');
+  assert.match(sync, /const modules = \['app', 'auth', 'errors', 'http', 'store'\];/);
+  for (const name of ['errors', 'http', 'store']) {
+    assert.equal((await readFile(new URL(`../integrations/dsh/src/${name}.ts`, import.meta.url), 'utf8')).trim().split('\n').pop(), `export * from './core/${name}.js';`);
+  }
+  const auth = await readFile(new URL('../integrations/dsh/src/auth.ts', import.meta.url), 'utf8');
+  assert.match(auth, /export \* from '\.\/core\/auth\.js';/);
+  // No second implementation of the token or storage logic remains in the integration.
+  assert.doesNotMatch(auth, /grant_type|refresh_token|CryptProtect|transaction\(/);
 });
 
 test('an already aborted JSON read cancels and unlocks its response body without reading', async () => {
