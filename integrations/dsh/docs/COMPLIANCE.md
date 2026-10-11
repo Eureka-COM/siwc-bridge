@@ -22,6 +22,7 @@
 | S12 | [dsh source](https://github.com/deepseek-ai/deepseek-harness/tree/5badb15009ae1756c3afe0ae0cef1faafc290ccc) / README、AGENTS、SAFETY、adapter/agent/tool types | 確認済み。npm0.2.1-alpha.1のbuilt型とも照合。本体未変更 |
 | S13 | [LLM adapter guide](https://deepseek-harness.github.io/deepseek-harness/en/develop/practice/llm-adapter) / registration、stream、model、packaging | 確認済み。ctx.llm.registerAdapter、外部bundle、正式profile/CLI |
 | S14 | [ChatGPT plan in other apps](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites) / permission、usage、limits、credits、disconnect | 確認済み。追加課金は本人設定。公式画面の実アカウント計上は未確認 |
+| S15 | [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) / Supported tools（2026-10-12確認） | 確認済み。「Web search remains subject to model and account/workspace policy」。DSHの `web_search` を、検索専用の要求（hosted `web_search`、`tool_choice: required`、`store:false`、`stream:true`、`response.completed` で成功）で処理する。会話のターンにはhosted toolを送らない。方針により拒否された場合は、その旨を表示する |
 
 選択方式は、公式公開OAuth/OIDCとpublic Responsesを独立実装し、標準crypto、維持されているjose、Windows DPAPIを使う方式です。DevKit公開APIにはtools・tool result・raw output・usageの入出力口がないため、未改変APIだけで初期要件を満たせません。private token/storeやprivate APIから不足を補いません。汎用proxy・別課金・新Agent Loopは作りません。
 
