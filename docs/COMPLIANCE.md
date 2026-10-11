@@ -28,7 +28,7 @@
 
 SDK の再利用性は、他のアプリへ同じ接続やトークンを配ることを意味しません。各利用アプリは実際の `appName`、安定した `appId` と保存領域、本人の公式ログインを使います。SDK は汎用 HTTP proxy や別アプリへの資格情報の自動取り込み・配布用CLIを提供せず、接続した本人・アプリの要求だけを送る用途です。下位APIで受け取るトークンを他アプリへ共有・送信しない責任も利用アプリにあります。
 
-保存先は `%LOCALAPPDATA%\siwc-bridge\apps\<appId>`。不正な識別子・制御文字・Windows 予約名を拒否し、資格情報を CurrentUser DPAPI で保護します。既存 Codex、ブラウザ、他アプリの保存領域を探索・読取・移行しません。登録 ID、verified identity、returned scope、expiry、回転した token を整合させて保存し、ログに出しません。
+保存先は `%USERPROFILE%\.siwc-bridge\apps\<appId>`（パッケージ化されたアプリから起動したプロセスには `%LOCALAPPDATA%` が別コピーとして見えるため、v0.3.0 で変更）。同じ appId の以前の保存先 `%LOCALAPPDATA%\siwc-bridge\apps\<appId>` からだけ、資格情報と要求予算を一度移します。不正な識別子・制御文字・Windows 予約名を拒否し、資格情報を CurrentUser DPAPI で保護します。既存 Codex、ブラウザ、他アプリの保存領域を探索・読取・移行しません。登録 ID、verified identity、returned scope、expiry、回転した token を整合させて保存し、ログに出しません。
 
 モデルの native tool call を返すことと、ツールを実行することは別です。SDK は実行せず、利用アプリの既存ループが許可・引数・ローカル実行を管理します。アプリを横断する接続共有や、別人の要求の処理に利用しません。
 

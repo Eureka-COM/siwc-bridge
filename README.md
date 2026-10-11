@@ -173,7 +173,7 @@ SDK・DSHとも、エラー本文、モデル一覧、Discovery、JWKS、OAuth�
 
 ## 停止・保存・削除
 
-SDKの保存先は`%LOCALAPPDATA%\siwc-bridge\apps\<appId>`です。登録・host ID・資格情報・要求予算をアプリごとに分け、資格情報をCurrentUser DPAPIで保護します。別Windowsユーザー・別端末へ資格情報をコピーして再利用しません。
+SDKの保存先は`%USERPROFILE%\.siwc-bridge\apps\<appId>`です（v0.3.0 より前は`%LOCALAPPDATA%\siwc-bridge\apps\<appId>`。ストアアプリなどから起動したプログラムには、Windowsが`%LOCALAPPDATA%`の別コピーを見せるため変更しました。同じアプリの以前の資格情報と要求予算は、最初に使うときに一度だけ移します）。登録・host ID・資格情報・要求予算をアプリごとに分け、資格情報をCurrentUser DPAPIで保護します。別Windowsユーザー・別端末へ資格情報をコピーして再利用しません。
 
 `stop`は持続する開始許可をOFFにし、自プロセスの進行中要求を中断します。他プロセスで送信済みの要求や使用量を取り消す操作ではありません。
 

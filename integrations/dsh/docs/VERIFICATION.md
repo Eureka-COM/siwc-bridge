@@ -4,7 +4,7 @@
 
 通常のテスト（`npm.cmd test`）は架空の資格情報と模擬応答だけを使います。v0.3.0 からは、開発者のWindows PCで、本人のChatGPTプランに対する**実際の通信による通しテスト**（`npm.cmd run e2e`、`npm.cmd run e2e:web`）も行っています。公式Usageへの計上や請求額の確認は、このリポジトリの検証には含みません。
 
-アプリ名は `SIWC Bridge for DSH`、保存先は `%LOCALAPPDATA%\siwc-bridge-dsh` です。
+アプリ名は `SIWC Bridge for DSH`、保存先は `%USERPROFILE%\.siwc-bridge\apps\siwc-bridge-dsh` です（v0.3.0 より前は `%LOCALAPPDATA%\siwc-bridge-dsh`）。
 
 ## 2026-10-11 v0.3.0 薄いアダプターへの作り直しと実通信テスト
 
@@ -17,6 +17,7 @@ v0.2 までの「確認できないものは全部止める」作りが、DSHで
 - 一時的な障害はDSHの再試行機能に任せ、利用上限のエラーでは新しい要求を止めて Manage usage へ案内します（`/siwc resume` で再開）。
 - 起動時の設定で、DSHの読み取り専用モードやダミーの作業フォルダを強制しないようにしました。
 - 入力欄の横に「Using ChatGPT plan · Manage usage」を表示します（SIWCのUIガイドライン）。
+- 保存先を `%LOCALAPPDATA%\siwc-bridge-dsh` から `%USERPROFILE%\.siwc-bridge\apps\siwc-bridge-dsh` へ移しました。パッケージ化されたアプリ（ストアアプリなど）から起動したプログラムには、Windowsが `%LOCALAPPDATA%` の別コピーを見せます。そのため、そこからサインインすると、エクスプローラーから起動したDSHではサインインしていない状態に見えていました（既定モデルが空になる症状も同じ原因です）。以前の場所のサインイン情報・モデル一覧・既定モデルは、最初に使うときに一度だけ移します。新しい場所にあるものは置き換えず、移したサインイン情報の古いコピーは削除します。
 
 ### 実際の通信で確認したこと（gpt-6.1-sol、一部 gpt-6-astra）
 
@@ -50,7 +51,7 @@ Windows上でbuild/typecheckと、SDK 68件・DSH 96件のテスト、モック�
 - **PowerShellの起動**：システムフォルダの絶対パスだけを使い、作業フォルダやPATH上の同名ファイルを起動しません（実行時・配布スクリプト・テストすべて）。
 - **送信直前の登録照合（SDK）**：トークンと同じ保存状態から読んだ登録IDを、履歴の登録と照合してから送信します。独立監査の再現テスト（`--expect-fixed`）を `npm test` に組み込み、登録が異なる要求が送信関数に1回も到達しないことを確認しました。
 - **ロックの保持時間**：資格情報のOSロックは、トークン更新の確定と、ログイン前後の短い読み書きだけで取ります。推論の応答待ちやブラウザでの同意中は保持しません。
-- **共通化**：DSH接続は、認証・保存・HTTP読込・エラーをSDKのソースからビルド時に生成します（`scripts/sync-core.mjs`）。アプリ名「SIWC Bridge for DSH」と保存先 `%LOCALAPPDATA%\siwc-bridge-dsh` は従来どおりです。
+- **共通化**：DSH接続は、認証・保存・HTTP読込・エラーをSDKのソースからビルド時に生成します（`scripts/sync-core.mjs`）。アプリ名「SIWC Bridge for DSH」と、当時の保存先 `%LOCALAPPDATA%\siwc-bridge-dsh` は従来どおりでした（v0.3.0 で変更）。
 
 ## 2026-10-11 読み込みの高速化とモデル一覧
 

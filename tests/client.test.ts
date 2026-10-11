@@ -198,7 +198,7 @@ test('clear during an in-flight response cancels it and prevents cache repopulat
 
 test('Windows factory persists quota stops across reconstruction until a new human begin', async () => {
   const folder = await mkdtemp(join(tmpdir(), 'siwc-sdk-quota-'));
-  const oldLocal = process.env.LOCALAPPDATA; const oldFetch = globalThis.fetch;
+  const oldLocal = process.env.LOCALAPPDATA; const oldProfile = process.env.USERPROFILE; const oldFetch = globalThis.fetch;
   let inference = 0;
   const request = { model: 'fixture', input: [{ role: 'user' as const, content: 'test' }] };
   const synthetic = (appId: string) => {
@@ -209,7 +209,7 @@ test('Windows factory persists quota stops across reconstruction until a new hum
     return runtime;
   };
   try {
-    process.env.LOCALAPPDATA = folder;
+    process.env.LOCALAPPDATA = folder; process.env.USERPROFILE = folder;
     for (const [index, code] of ['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable'].entries()) {
       const id = `synthetic-quota-${index}`;
       globalThis.fetch = async url => {
@@ -231,5 +231,6 @@ test('Windows factory persists quota stops across reconstruction until a new hum
   } finally {
     globalThis.fetch = oldFetch;
     if (oldLocal === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = oldLocal;
+    if (oldProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldProfile;
   }
 });

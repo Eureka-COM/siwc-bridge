@@ -20,7 +20,7 @@ const safe = (value: string | number): string => String(value).replace(/[^A-Za-z
 export function diskDiagnostics(directory: () => string = applicationDirectory): Diagnostics {
   let queue: Promise<void> = Promise.resolve();
   const file = () => join(directory(), 'diagnostics.log');
-  let location = '%LOCALAPPDATA%\\siwc-bridge-dsh\\diagnostics.log';
+  let location = '%USERPROFILE%\\.siwc-bridge\\apps\\siwc-bridge-dsh\\diagnostics.log';
   try { location = file(); } catch { /* not on Windows: location stays descriptive */ }
   return {
     location,

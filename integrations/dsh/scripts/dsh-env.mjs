@@ -12,7 +12,6 @@ export const MOCK_PROFILE = 'siwc-mock';
 export const paths = Object.freeze({
   root, work: join(root, '.work'), home: join(root, '.work', 'dsh-home'),
   workspace: join(root, '.work', 'dummy-workspace'),
-  selectedModel: process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'siwc-bridge-dsh', 'selected-model.json') : undefined,
   guardFixture: join(root, 'tests', 'fixtures', 'guard.mjs'),
   mockFixture: join(root, 'tests', 'fixtures', 'mock-plugin.mjs'),
 });

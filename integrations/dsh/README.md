@@ -61,7 +61,9 @@ DSH画面では `/siwc`、ターミナルでは `node lib/cli.js` で使いま�
 
 ## 保存するもの
 
-すべて `%LOCALAPPDATA%\siwc-bridge-dsh` にあり、このWindowsユーザーだけが読めます。
+すべて `%USERPROFILE%\.siwc-bridge\apps\siwc-bridge-dsh` にあり、このWindowsユーザーだけが読めます。
+
+v0.3.0 より前は `%LOCALAPPDATA%\siwc-bridge-dsh` に保存していました。Windowsは、ストアアプリなどのパッケージ化されたアプリから起動したプログラムに、`%LOCALAPPDATA%` の専用の別コピーを見せます。そのため、起動のしかたによって別のサインイン状態が見え、「サインインしたのにDSHでは未サインイン」になることがありました。ユーザーフォルダはどの起動方法でも同じです。以前の場所にあるサインイン情報・モデル一覧・既定モデルは、最初に使うときに一度だけ新しい場所へ移します（新しい場所にすでにあるものは置き換えません）。
 
 - `credentials.dpapi`：サインイン情報（Windows DPAPIで暗号化）
 - `model-catalog.json`：モデル一覧（名前だけ）。次回すぐ表示するために使い、裏で最新化します。
@@ -87,7 +89,7 @@ npm.cmd run remove:plugin
 npm.cmd run setup
 ```
 
-サインアウトは、この端末のトークンを削除し、サーバー側での失効も試みます。接続そのものの解除は ChatGPT の Security and login → Login connections → Sign in with ChatGPT → Disconnect です。完全に消す場合は、サインアウト後に `%LOCALAPPDATA%\siwc-bridge-dsh` とこのフォルダを削除してください。
+サインアウトは、この端末のトークンを削除し、サーバー側での失効も試みます。接続そのものの解除は ChatGPT の Security and login → Login connections → Sign in with ChatGPT → Disconnect です。完全に消す場合は、サインアウト後に `%USERPROFILE%\.siwc-bridge\apps\siwc-bridge-dsh`、以前の `%LOCALAPPDATA%\siwc-bridge-dsh`（あれば）、このフォルダを削除してください。
 
 ## 確認した版と資料
 

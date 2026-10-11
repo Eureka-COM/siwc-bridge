@@ -1,13 +1,13 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, lstat, open, readFile, rename, unlink, stat } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { copyFile, link, mkdir, lstat, open, readFile, rename, unlink, stat } from 'node:fs/promises';
+import { constants, existsSync } from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
-import { join, resolve, relative, isAbsolute } from 'node:path';
+import { dirname, join, resolve, relative, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { appDirectory } from './app.js';
+import { appDirectory, legacyAppDirectory } from './app.js';
 import { BridgeError } from './errors.js';
 
 export interface Credentials {
@@ -281,11 +281,63 @@ function validateState(value: unknown): CredentialState {
   return state;
 }
 
+const exists = (filename: string): Promise<boolean> => lstat(filename).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return false; throw error; });
+const adoptions = new Map<string, Promise<void>>();
+/**
+ * Moves one file of the same app from its earlier folder, at most once per process.
+ * The file appears in the new folder in one step and never replaces a file already
+ * there (a newer sign-in wins). The earlier copy is removed only after it was adopted,
+ * so no stale secret stays behind. Links are never followed.
+ */
+export function adoptLegacyFile(directory: string, legacy: string | undefined, name: string): Promise<void> {
+  if (!legacy || resolve(legacy).toLowerCase() === resolve(directory).toLowerCase()) return Promise.resolve();
+  const key = `${resolve(directory).toLowerCase()}|${name}`;
+  const running = adoptions.get(key);
+  if (running) return running;
+  const pending = adopt(join(legacy, name), join(directory, name)).catch(error => { adoptions.delete(key); throw error; });
+  adoptions.set(key, pending);
+  return pending;
+}
+async function adopt(source: string, target: string): Promise<void> {
+  if (await exists(target)) return;
+  let data: Buffer;
+  try {
+    if (!(await lstat(source)).isFile()) return;
+    data = await readFile(source);
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
+  await mkdir(dirname(target), { recursive: true });
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  let adopted = false;
+  try {
+    const file = await open(temporary, 'wx', 0o600);
+    try { await file.writeFile(data); await file.sync(); } finally { await file.close(); }
+    try { await link(temporary, target); adopted = true; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        // A volume without hard links: an exclusive copy still never replaces a newer file.
+        try { await copyFile(temporary, target, constants.COPYFILE_EXCL); adopted = true; }
+        catch (copyError) { if ((copyError as NodeJS.ErrnoException).code !== 'EEXIST') throw copyError; }
+      }
+    }
+  } finally { data.fill(0); await unlink(temporary).catch(() => undefined); }
+  if (adopted) await unlink(source).catch(() => undefined);
+}
+
 export class WindowsStore implements AuthStore {
   #directory: string;
-  /** `directory` is for an integration that already owns a fixed per-app folder; the package entry never exposes it. */
-  constructor(appId: string, directory?: string) { this.#directory = directory ?? appDirectory(appId); }
+  #legacy: string | undefined;
+  /** `directory` and `legacyDirectory` are for an integration that already owns fixed per-app folders; the package entry never exposes them. */
+  constructor(appId: string, directory?: string, legacyDirectory?: string) {
+    this.#directory = directory ?? appDirectory(appId);
+    this.#legacy = directory === undefined ? legacyAppDirectory(appId) : legacyDirectory;
+  }
+  async #adopt(signal?: AbortSignal): Promise<void> {
+    checkAbort(signal);
+    try { await adoptLegacyFile(this.#directory, this.#legacy, 'credentials.dpapi'); }
+    catch { throw new BridgeError('secure_storage_unavailable', '以前の保存場所から資格情報を移せません。平文への切り替えは行いません。'); }
+  }
   async transaction<T>(operation: (state: CredentialState, checkpoint: () => Promise<void>) => Promise<T>, signal?: AbortSignal, options?: TransactionOptions): Promise<T> {
+    await this.#adopt(signal);
     return diskTransaction(this.#directory, operation, signal, options);
   }
   async openRequestScope(signal?: AbortSignal): Promise<RequestScope> { return openDiskRequestScope(this.#directory, signal); }

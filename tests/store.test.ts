@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn, execFile } from 'node:child_process';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { promisify } from 'node:util';
-import { createMemoryTestStore, createWindowsTestStore, systemPowerShell } from '../lib/store.js';
-import { appDirectory, validateAppIdentity } from '../lib/app.js';
+import { adoptLegacyFile, createMemoryTestStore, createWindowsTestStore, systemPowerShell, WindowsStore } from '../lib/store.js';
+import { appDirectory, legacyAppDirectory, validateAppIdentity } from '../lib/app.js';
+import { RequestBudget } from '../lib/budget.js';
 
 test('application identity accepts display names but rejects paths, Windows reserved IDs, and control characters', () => {
   assert.deepEqual(validateAppIdentity({ appId: 'fixture-tool', appName: 'Fixture Local Tool' }), { appId: 'fixture-tool', appName: 'Fixture Local Tool' });
@@ -23,9 +24,85 @@ test('application identity accepts display names but rejects paths, Windows rese
   if (process.platform === 'win32') {
     const first = appDirectory('fixture-one');
     const second = appDirectory('fixture-two');
-    assert.equal(first.endsWith(join('siwc-bridge', 'apps', 'fixture-one')), true);
+    assert.equal(first, join(process.env.USERPROFILE!, '.siwc-bridge', 'apps', 'fixture-one'));
     assert.equal(first === second, false);
     assert.equal(first.includes('dsh-siwc-bridge'), false);
+    // %LOCALAPPDATA% is private per packaged (MSIX) parent app, so it is only a source to move from.
+    assert.equal(legacyAppDirectory('fixture-one'), join(process.env.LOCALAPPDATA!, 'siwc-bridge', 'apps', 'fixture-one'));
+  }
+});
+
+async function folders(prefix: string) {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const legacy = join(root, 'legacy'), current = join(root, 'current');
+  await mkdir(legacy, { recursive: true });
+  return { root, legacy, current };
+}
+const has = (file: string) => readFile(file).then(() => true, () => false);
+
+test('a file of the same app moves once from its earlier folder, and concurrent callers share that move', async () => {
+  const { legacy, current } = await folders('siwc-adopt-move-');
+  await writeFile(join(legacy, 'credentials.dpapi'), 'encrypted-fixture');
+  const calls = await Promise.all([1, 2, 3].map(() => adoptLegacyFile(current, legacy, 'credentials.dpapi')));
+  assert.equal(calls.length, 3);
+  assert.equal(await readFile(join(current, 'credentials.dpapi'), 'utf8'), 'encrypted-fixture');
+  assert.equal(await has(join(legacy, 'credentials.dpapi')), false, 'no stale copy is left behind');
+  assert.deepEqual((await readdir(current)).filter(name => name.endsWith('.tmp')), []);
+});
+
+test('a file already in the new folder is never replaced, and the earlier copy is then left alone', async () => {
+  const { legacy, current } = await folders('siwc-adopt-newer-');
+  await mkdir(current, { recursive: true });
+  await writeFile(join(current, 'credentials.dpapi'), 'newer-sign-in');
+  await writeFile(join(legacy, 'credentials.dpapi'), 'older-sign-in');
+  await adoptLegacyFile(current, legacy, 'credentials.dpapi');
+  assert.equal(await readFile(join(current, 'credentials.dpapi'), 'utf8'), 'newer-sign-in');
+  assert.equal(await readFile(join(legacy, 'credentials.dpapi'), 'utf8'), 'older-sign-in');
+});
+
+test('no earlier folder, no earlier file, or the same folder: nothing is created', async () => {
+  const { legacy, current } = await folders('siwc-adopt-none-');
+  await adoptLegacyFile(current, undefined, 'credentials.dpapi');
+  await adoptLegacyFile(current, legacy, 'credentials.dpapi');
+  await writeFile(join(legacy, 'requests.json'), '{}');
+  await adoptLegacyFile(legacy, legacy, 'requests.json');
+  assert.equal(await has(join(current, 'credentials.dpapi')), false);
+  assert.equal(await readFile(join(legacy, 'requests.json'), 'utf8'), '{}');
+});
+
+test('a link in the earlier folder is never followed', async t => {
+  const { root, legacy, current } = await folders('siwc-adopt-link-');
+  await writeFile(join(root, 'elsewhere'), 'not-this-app');
+  try { await symlink(join(root, 'elsewhere'), join(legacy, 'credentials.dpapi')); }
+  catch { t.skip('This account cannot create symbolic links'); return; }
+  await adoptLegacyFile(current, legacy, 'credentials.dpapi');
+  assert.equal(await has(join(current, 'credentials.dpapi')), false);
+});
+
+test('Windows: a DPAPI sign-in and a quota stop written in the earlier folder are read from the profile folder after the move', { skip: process.platform !== 'win32', timeout: 60_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'siwc-test-move-'));
+  const legacy = join(root, 'legacy-store'), current = join(root, 'current-store');
+  await mkdir(legacy, { recursive: true });
+  await createWindowsTestStore(legacy).transaction(async state => {
+    state.registrations.push({ id: 'fixture', label: 'Fixture only', clientId: 'oaiapp_fixture', planConfirmed: true });
+    state.activeId = 'fixture';
+  });
+  const moved = new WindowsStore('fixture-move', current, legacy);
+  assert.equal(await moved.transaction(async state => state.activeId, undefined, { shared: true }), 'fixture');
+  assert.equal(await has(join(legacy, 'credentials.dpapi')), false);
+
+  const previous = { profile: process.env.USERPROFILE, local: process.env.LOCALAPPDATA };
+  try {
+    process.env.USERPROFILE = join(root, 'profile'); process.env.LOCALAPPDATA = join(root, 'local');
+    const old = legacyAppDirectory('fixture-quota')!;
+    await mkdir(old, { recursive: true });
+    await writeFile(join(old, 'requests.json'), JSON.stringify({ version: 1, enabled: false, auth: 1, models: 2, inference: 5, allowedThrough: 5, generation: 3 }));
+    const status = await new RequestBudget('fixture-quota').status();
+    assert.equal(status.enabled, false); assert.equal(status.inference, 5); assert.equal(status.generation, 3);
+    assert.equal(await has(join(appDirectory('fixture-quota'), 'requests.json')), true);
+  } finally {
+    if (previous.profile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previous.profile;
+    if (previous.local === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous.local;
   }
 });
 

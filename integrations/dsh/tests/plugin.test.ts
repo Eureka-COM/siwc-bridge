@@ -25,7 +25,7 @@ test('the plugin registers one provider and one command, and no longer refuses a
 
 test('/siwc commands that need no sign-in respond without any network request', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'siwc-dsh-command-'));
-  const previous = process.env.LOCALAPPDATA; process.env.LOCALAPPDATA = directory;
+  const previous = process.env.LOCALAPPDATA, profile = process.env.USERPROFILE; process.env.LOCALAPPDATA = directory; process.env.USERPROFILE = directory;
   let requests = 0;
   t.mock.method(globalThis, 'fetch', async () => { requests++; throw new Error('No network in this fixture'); });
   try {
@@ -37,5 +37,8 @@ test('/siwc commands that need no sign-in respond without any network request', 
     assert.equal((await invoke('select')).kind, 'error');
     assert.match((await invoke('diagnostics')).text, /診断ログ/);
     assert.equal(requests, 0);
-  } finally { if (previous === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous; }
+  } finally {
+    if (previous === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous;
+    if (profile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = profile;
+  }
 });

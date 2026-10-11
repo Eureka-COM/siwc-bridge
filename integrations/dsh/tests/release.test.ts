@@ -19,7 +19,7 @@ test('standalone DSH publication rejects fixed paths and accepts portable refere
   assert.equal(matcher.test('workspace=' + slash.repeat(2) + ['example-host', 'private-share'].join(slash)), true);
   assert.equal(matcher.test(slash.repeat(2) + '?' + slash + ['UNC', 'example-host', 'private-share'].join(slash)), true);
   assert.equal(matcher.test(['file', ':', '/', '/', '/'].join('') + ['home', 'example-account'].join('/')), true);
-  for (const value of ['https://api.openai.com/v1/responses', '//cdn.example.org/assets/client.js', 'src/adapter.ts', '%LOCALAPPDATA%' + slash + 'siwc-bridge-dsh', '/auth/callback']) {
+  for (const value of ['https://api.openai.com/v1/responses', '//cdn.example.org/assets/client.js', 'src/adapter.ts', '%LOCALAPPDATA%' + slash + 'siwc-bridge-dsh', ['%USERPROFILE%', '.siwc-bridge', 'apps', 'siwc-bridge-dsh'].join(slash), '/auth/callback']) {
     assert.equal(matcher.test(value), false);
   }
 });

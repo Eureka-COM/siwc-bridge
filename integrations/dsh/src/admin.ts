@@ -1,6 +1,6 @@
 import { AuthManager, type AuthStatus } from './auth.js';
 import { SiwcAdapter, type AdapterOptions } from './adapter.js';
-import { diskCatalogStore, applicationDirectory } from './local-cache.js';
+import { adoptLegacyState, diskCatalogStore, applicationDirectory } from './local-cache.js';
 import { diskDiagnostics, type Diagnostics } from './diagnostics.js';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -33,12 +33,14 @@ function selectionFile(): string { return join(applicationDirectory(), 'selected
 /** The model a new DSH start uses by default; choosing a model in the DSH selector works without it. */
 export async function saveModel(auth: AuthManager, slug: string): Promise<void> {
   const status = await auth.status();
+  await adoptLegacyState();
   const file = selectionFile();
   await mkdir(join(file, '..'), { recursive: true });
   await writeFile(file, JSON.stringify({ model: slug, registrationId: status.activeId }), { encoding: 'utf8', mode: 0o600 });
 }
 export async function selectedModel(auth: AuthManager): Promise<string | undefined> {
   try {
+    await adoptLegacyState();
     const row = JSON.parse(await readFile(selectionFile(), 'utf8')) as { model?: unknown; registrationId?: unknown };
     if (typeof row.model !== 'string' || row.registrationId !== (await auth.status()).activeId) return undefined;
     return row.model;

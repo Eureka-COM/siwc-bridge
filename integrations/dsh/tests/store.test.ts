@@ -15,6 +15,7 @@ test('memory test store has stable host identity and separate serialized registr
   await Promise.all([1, 2].map(n => store.transaction(async state => { state.registrations.push({ id: `fixture-${n}`, label: `Fixture ${n}`, clientId: `oaiapp_fixture_${n}`, planConfirmed: false }); })));
   await store.transaction(async state => { assert.equal(state.hostId, host); assert.equal(state.registrations.length, 2); });
   assert.throws(() => createWindowsTestStore(join(process.env.LOCALAPPDATA ?? dirname(tmpdir()), 'siwc-bridge-dsh')));
+  assert.throws(() => createWindowsTestStore(join(process.env.USERPROFILE ?? dirname(tmpdir()), '.siwc-bridge', 'apps', 'siwc-bridge-dsh')));
 });
 
 test('a queued transaction settles promptly on abort without executing or overtaking the queue', async () => {
