@@ -380,7 +380,7 @@ export class ResponseStream {
     // The final response is authoritative; when it is empty, finished stream items are used.
     const output: Record<string, unknown>[] = reported.length > 0 ? reported.map(item => structuredClone(item))
       : [...this.items.entries()].sort(([a], [b]) => a - b).flatMap(([, item]) => item.done ? [item.done] : []);
-    if (reported.length === 0 && this.items.size > 0) this.notes.add('stream.output_from_items');
+    // The ChatGPT-plan route normally sends an empty final output; the finished items are the answer.
     const chunks: StreamChunk[] = [];
     const calls: { id: string; name: string; arguments: string }[] = [];
     const seen = new Set<string>();
