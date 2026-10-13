@@ -6,19 +6,26 @@ import { join } from 'node:path';
 import { apply } from '../lib/index.js';
 
 function load() {
-  const events = new Map<string, Function>(); let handler: Function | undefined; const registered: string[][] = []; const searchProviders: any[] = [];
+  const events = new Map<string, Function>(); let handler: Function | undefined; const registered: string[][] = []; const searchProviders: any[] = []; const tools: any[] = [];
   const context = {
     llm: { registerAdapter(providers: string[]) { registered.push(providers); return { replace() {} }; } },
     effect() {}, get() { return undefined; },
     on(name: string, callback: Function) { events.set(name, callback); },
     inject(names: string[], callback: Function) {
       if (names.includes('web')) callback({ web: { registerSearchProvider(provider: unknown) { searchProviders.push(provider); return () => undefined; } } });
+      else if (names.includes('tools')) callback({ tools: { register(tool: unknown) { tools.push(tool); return () => undefined; } } });
       else callback({ commands: { register(command: { handler: Function }) { handler = command.handler; } } });
     },
   };
   apply(context as never);
-  return { events, registered, searchProviders, invoke: (rawInput: string) => handler!({ rawInput, signal: new AbortController().signal }) };
+  return { events, registered, searchProviders, tools, invoke: (rawInput: string) => handler!({ rawInput, signal: new AbortController().signal }) };
 }
+
+test('the plugin adds the read_pdf tool, since DSH’s own read and web_fetch cannot decode PDFs', () => {
+  const { tools } = load();
+  assert.deepEqual(tools.map(tool => tool.name), ['read_pdf']);
+  assert.match(tools[0].description, /application\/pdf/);
+});
 
 test('DSH’s own web_search tool gets a ChatGPT-plan search provider instead of needing a DeepSeek key', () => {
   const { searchProviders } = load();

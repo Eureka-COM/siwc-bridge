@@ -7,6 +7,7 @@ import { createServices, defaultModel, signIn, saveModel, statusText, MANAGE_USA
 import type { ImageSource } from './adapter.js';
 import { safeFailure } from './errors.js';
 import { SiwcSearchProvider, type WebSearchProvider } from './web-search.js';
+import { pdfTool, type PdfToolServices } from './pdf-tool.js';
 
 export const name = 'dsh-siwc-bridge';
 export const inject = ['llm'];
@@ -15,7 +16,8 @@ const HELP = '/siwc [status] | login [登録ID] | models | model <slug> | select
 
 /**
  * One model provider ("ChatGPT plan (SIWC)"), one web search provider for DSH's own
- * `web_search` tool, and one slash command. Everything else is DSH's own behaviour.
+ * `web_search` tool, the `read_pdf` tool (PDFs go to the model as files), and one slash
+ * command. Everything else is DSH's own behaviour.
  */
 export function apply(ctx: Context): void {
   const service = <T>(name: string) => (ctx as unknown as { get(name: string): T | undefined }).get(name);
@@ -37,6 +39,13 @@ export function apply(ctx: Context): void {
     if (context?.provider === 'siwc' && context.model) return context.model;
     return defaultModel(auth, adapter);
   };
+  // DSH reads only text and images; read_pdf records a PDF that the adapter attaches as a file.
+  ctx.inject(['tools'], toolCtx => {
+    (toolCtx as unknown as { tools: { register(definition: unknown): unknown } }).tools.register(pdfTool({
+      fs: () => service<ReturnType<PdfToolServices['fs']>>('fs') ?? undefined,
+      attachments: () => service<ReturnType<PdfToolServices['attachments']>>('attachments') ?? undefined,
+    }));
+  });
   ctx.inject(['web'], webCtx => {
     (webCtx as unknown as { web: { registerSearchProvider(provider: WebSearchProvider): () => void } }).web.registerSearchProvider(new SiwcSearchProvider(adapter, currentModel));
   });

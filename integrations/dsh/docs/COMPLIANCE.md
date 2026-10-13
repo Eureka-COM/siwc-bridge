@@ -23,6 +23,7 @@
 | S13 | [LLM adapter guide](https://deepseek-harness.github.io/deepseek-harness/en/develop/practice/llm-adapter) / registration、stream、model、packaging | 確認済み。ctx.llm.registerAdapter、外部bundle、正式profile/CLI |
 | S14 | [ChatGPT plan in other apps](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites) / permission、usage、limits、credits、disconnect | 確認済み。追加課金は本人設定。公式画面の実アカウント計上は未確認 |
 | S15 | [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) / Supported tools（2026-10-12確認） | 確認済み。「Web search remains subject to model and account/workspace policy」。DSHの `web_search` を、検索専用の要求（hosted `web_search`、`tool_choice: required`、`store:false`、`stream:true`、`response.completed` で成功）で処理する。会話のターンにはhosted toolを送らない。方針により拒否された場合は、その旨を表示する |
+| S16 | [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) / Inputs（2026-10-13確認） | 確認済み。「Text, images, and files work if the model accepts them」。`read_pdf` の結果に限り、PDFを `input_file`（`file_url` または `file_data`）として関数結果に添付する。拒否された場合は添付せずに一度だけ再送し、その会話では以後添付しない。Files upload APIは使わない |
 
 選択方式は、公式公開OAuth/OIDCとpublic Responsesを独立実装し、標準crypto、維持されているjose、Windows DPAPIを使う方式です。DevKit公開APIにはtools・tool result・raw output・usageの入出力口がないため、未改変APIだけで初期要件を満たせません。private token/storeやprivate APIから不足を補いません。汎用proxy・別課金・新Agent Loopは作りません。
 

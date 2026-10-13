@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { BridgeError } from './errors.js';
 import { reasoningRequest } from './reasoning.js';
+import { documentKey, parseDocuments, PDF_TOOL } from './documents.js';
 
 /**
  * DSH ↔ Responses translation for the ChatGPT-plan route (SIWC).
@@ -74,8 +75,13 @@ export interface RequestMedia {
 }
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
+/** A PDF ready to attach: the service downloads a URL itself; a stored file is sent as data. */
+export interface RequestDocument { fileUrl?: string; fileData?: string; filename: string }
+
 export interface BuildContext {
   registrationId?: string; media?: RequestMedia; notes?: Notes;
+  /** PDFs recorded by read_pdf results, keyed by documentKey; a missing key becomes a visible note. */
+  documents?: ReadonlyMap<string, RequestDocument>;
   /** Filled by buildRequest: function name sent to the service → DSH tool name. */
   toolNames?: Map<string, string>;
 }
@@ -117,6 +123,28 @@ function content(message: RequestMessage, context: BuildContext): string | Recor
   }
   if (parts.every(part => part.type === 'input_text')) return parts.map(part => String(part.text)).join('\n');
   return parts;
+}
+
+/**
+ * A read_pdf result: its text without the marker, then the PDF itself. Only results of
+ * that tool are read this way, so marker text from elsewhere never attaches anything.
+ */
+function documentOutput(message: RequestMessage, context: BuildContext): Record<string, unknown>[] {
+  const base = content(message, context);
+  const parts = typeof base === 'string' ? (base === '' ? [] : [{ type: 'input_text', text: base }]) : base;
+  const output: Record<string, unknown>[] = [];
+  for (const part of parts) {
+    if (part.type !== 'input_text') { output.push(part); continue; }
+    const { refs, text: rest } = parseDocuments(String(part.text));
+    if (rest !== '') output.push({ type: 'input_text', text: rest });
+    for (const ref of refs) {
+      const document = context.documents?.get(documentKey(ref));
+      if (document?.fileUrl) output.push({ type: 'input_file', file_url: document.fileUrl });
+      else if (document?.fileData) output.push({ type: 'input_file', filename: document.filename, file_data: `data:application/pdf;base64,${document.fileData}` });
+      else { context.notes?.add('request.document_unavailable'); output.push({ type: 'input_text', text: '[This PDF could not be attached to the request. Tell the user it could not be read; do not guess its content.]' }); }
+    }
+  }
+  return output;
 }
 
 function plainText(message: RequestMessage, context: BuildContext): string {
@@ -165,14 +193,15 @@ export function buildRequest(options: GenerateOptions, context: BuildContext = {
     for (const id of pending) { input.push({ type: 'function_call_output', call_id: id, output: '[No result: this tool call did not complete.]' }); answered.add(id); context.notes?.add('request.open_call_closed'); }
     pending.clear();
   };
+  const callNames = new Map<string, string>();
   const addCall = (id: string, name: string, args: string, item?: Record<string, unknown>) => {
     if (known.has(id)) { context.notes?.add('request.duplicate_call_skipped'); return; }
-    known.add(id); pending.add(id);
+    known.add(id); pending.add(id); callNames.set(id, name);
     input.push(item ?? { type: 'function_call', namespace: TOOL_NAMESPACE, call_id: id, name, arguments: args === '' ? '{}' : args });
   };
   for (const message of options.messages) {
     if (message.role === 'tool') {
-      const output = content(message, context);
+      const output = callNames.get(message.toolCallId) === PDF_TOOL ? documentOutput(message, context) : content(message, context);
       if (pending.has(message.toolCallId)) {
         pending.delete(message.toolCallId); answered.add(message.toolCallId);
         input.push({ type: 'function_call_output', call_id: message.toolCallId, output });

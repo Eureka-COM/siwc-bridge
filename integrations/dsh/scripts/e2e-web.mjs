@@ -7,7 +7,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { crc32, deflateSync, zstdDecompressSync } from 'node:zlib';
-import { cleanEnvironment, initializeProfile, paths, resolveDshBin, runDsh, verifiedArchive, verifyInstalledPlugin, writeRuntimePatch, readSelectedModel } from './dsh-env.mjs';
+import { cleanEnvironment, initializeProfile, paths, resolveDshBin, runDsh, samplePdf, verifiedArchive, verifyInstalledPlugin, writeRuntimePatch, readSelectedModel } from './dsh-env.mjs';
 
 const HOME = join(paths.work, 'e2e-web-home');
 const PROFILE = 'siwc-e2e-web';
@@ -168,6 +168,22 @@ try {
     const result = await ask(sessionId, [{ type: 'text', text: '画像の色（日本語一語）と、ファイルに書かれた code の値を「色,値」の形で答えてください。' },
       { type: 'image', mediaType: 'image/png', data: png(30, 160, 60).toString('base64'), name: 'green.png' }, { type: 'file', receiptId: receipt.receiptId }], 0);
     check('image-and-file', result, result.reason === 'completed' && /緑|green/i.test(result.text) && result.text.includes(marker));
+  }
+
+  if (want('pdf-file')) {
+    // An attached PDF: DSH gives the model a path; read_pdf hands the document itself to the model.
+    const { sessionId } = await client.rpc('session/create', { cwd: workspace });
+    const word = `KUMQUAT-${randomBytes(3).toString('hex').toUpperCase()}`;
+    const receipt = await client.upload(sessionId, 'report.pdf', samplePdf(`The secret word is ${word}.`));
+    const result = await ask(sessionId, [{ type: 'text', text: '添付したPDFに書かれている secret word だけを返してください。' }, { type: 'file', receiptId: receipt.receiptId }], 0);
+    check('pdf-file', result, result.reason === 'completed' && result.tools.includes('read_pdf') && result.text.includes(word));
+  }
+
+  if (want('pdf-url')) {
+    // A PDF on the web: web_fetch cannot decode it; read_pdf lets the service download it for the model.
+    const { sessionId } = await client.rpc('session/create', { cwd: workspace });
+    const result = await ask(sessionId, [{ type: 'text', text: 'https://arxiv.org/pdf/1706.03762 のPDFを読んで、論文のタイトルと第一著者の名前を1行で答えてください。' }], 0);
+    check('pdf-url', result, result.reason === 'completed' && result.tools.includes('read_pdf') && /Attention Is All You Need/i.test(result.text) && /Vaswani/i.test(result.text));
   }
 
   if (want('compact')) {

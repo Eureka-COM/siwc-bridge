@@ -1,12 +1,12 @@
 // Real-account end-to-end checks through a headless DSH profile with the installed plugin.
 // Uses the signed-in ChatGPT plan: every scenario sends real requests. Run only when intended:
-//   node scripts/e2e.mjs [scenario ...]        (default: all: text tool continue switch search effort multitool subagent long)
+//   node scripts/e2e.mjs [scenario ...]        (default: all: text tool continue switch pdf search effort multitool subagent long)
 // Writes full run events to .work/e2e/<time>/ (test prompts only) and prints a summary.
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readdir, writeFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { initializeProfile, paths, runDsh, verifiedArchive, verifyInstalledPlugin, writeRuntimePatch, readSelectedModel } from './dsh-env.mjs';
+import { initializeProfile, paths, runDsh, samplePdf, verifiedArchive, verifyInstalledPlugin, writeRuntimePatch, readSelectedModel } from './dsh-env.mjs';
 
 const PROFILE = 'siwc-e2e';
 const workspace = join(paths.work, 'e2e-workspace');
@@ -81,6 +81,14 @@ if (want('continue') && toolSession) {
 if (want('switch') && toolSession && otherModel) {
   const r = await turn('switch', 'この会話で読んだファイルの value の値をもう一度だけ返してください。', { model: otherModel, sessionId: toolSession });
   check(r, r.exitCode === 0 && r.final.includes(marker), `model=${otherModel}`);
+}
+if (want('pdf')) {
+  // A PDF in the workspace: DSH's read cannot decode it; read_pdf gives the document to the model.
+  const word = `QUINCE-${randomBytes(3).toString('hex').toUpperCase()}`;
+  const file = join(workspace, 'notice.pdf');
+  await writeFile(file, samplePdf(`The code word is ${word}.`));
+  const r = await turn('pdf', `${file} のPDFに書かれている code word だけを返してください。`, { model });
+  check(r, r.exitCode === 0 && r.tools.includes('read_pdf') && r.final.includes(word));
 }
 if (want('search')) {
   // DSH's own web_search tool, answered through the ChatGPT plan (no DeepSeek key).

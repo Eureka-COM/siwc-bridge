@@ -7,16 +7,17 @@ import { readText } from './http.js';
 import { contextForModel, reasoningForModel, searchEffort } from './reasoning.js';
 import type { CatalogStore } from './local-cache.js';
 import { noDiagnostics, type Diagnostics } from './diagnostics.js';
-import { buildRequest, label, Notes, object, ProviderFailure, providerFailure, readSse, ResponseStream, type RequestImage, type RequestMedia } from './protocol.js';
+import { buildRequest, label, Notes, object, ProviderFailure, providerFailure, readSse, ResponseStream, type RequestDocument, type RequestImage, type RequestMedia } from './protocol.js';
 import { checkedQuery, SEARCH_TIMEOUT_MS, SearchCollector, searchRequest, type WebSearchRequest, type WebSearchResult } from './web-search.js';
+import { documentFileName, documentKey, MAX_PDF_BYTES, MAX_REQUEST_DOCUMENT_BASE64, parseDocuments, PDF_TOOL } from './documents.js';
 
 export interface CredentialSource {
   withAccessToken<T>(operation: (token: string, currentSignal?: AbortSignal, registrationId?: string) => Promise<T>, signal?: AbortSignal): Promise<T>;
   openRequestScope?: (signal?: AbortSignal) => Promise<{ signal: AbortSignal; check?(): Promise<void>; close(): void }>;
   status?: (signal?: AbortSignal) => Promise<{ activeId?: string; registrations?: readonly { id: string; authenticated: boolean; planAllowed: boolean; planConfirmed: boolean }[] }>;
 }
-/** The part of DSH's attachment service the adapter uses: read one request-sized image version. */
-export type ImageSource = Pick<AttachmentStore, 'readImageRequest'>;
+/** The parts of DSH's attachment service the adapter uses: request-sized images, and stored files for read_pdf. */
+export type ImageSource = Pick<AttachmentStore, 'readImageRequest'> & Partial<Pick<AttachmentStore, 'readFileStream'>>;
 export interface AdapterOptions {
   /** Last account catalog (slugs and display names only), shown at once while a background refresh runs. */
   catalogStore?: CatalogStore;
@@ -95,8 +96,16 @@ export function classify(error: unknown, signal?: AbortSignal): LlmError {
   return new SiwcLlmError(error, code);
 }
 
+/** A 400 that names a file or URL input: the service could not use an attached PDF. */
+function documentRejected(error: unknown): boolean {
+  return error instanceof ProviderFailure && error.status === 400
+    && (/url|file|document|pdf/i.test(error.param ?? '') || /file|pdf|document/i.test(error.code));
+}
+
 export class SiwcAdapter extends LlmAdapter {
   private paused = false;
+  /** PDFs the service refused in this process; later requests send a note instead. */
+  private readonly failedDocuments = new Set<string>();
   private readonly requests = new Set<AbortController>();
   private catalog?: { provider: string; registrationId: string; expiresAt: number; models: readonly LlmModelInfo[] };
   private catalogGeneration = 0;
@@ -291,6 +300,44 @@ export class SiwcAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * PDFs recorded by read_pdf results, newest first within the request budget. A URL is
+   * downloaded by the service; a stored file is read back from DSH's attachment store.
+   */
+  private async prepareDocuments(options: GenerateOptions, signal: AbortSignal, notes: Notes): Promise<Map<string, RequestDocument>> {
+    const documents = new Map<string, RequestDocument>();
+    const names = new Map<string, string>();
+    for (const message of options.messages) if (message.role === 'assistant') for (const block of message.content) if (block.type === 'tool-call') names.set(block.id, block.name);
+    let budget = MAX_REQUEST_DOCUMENT_BASE64;
+    for (const message of [...options.messages].reverse()) {
+      if (message.role !== 'tool' || names.get(message.toolCallId) !== PDF_TOOL) continue;
+      for (const block of message.content) {
+        if (block.type !== 'text') continue;
+        for (const ref of parseDocuments(block.text).refs) {
+          const key = documentKey(ref);
+          if (documents.has(key) || this.failedDocuments.has(key)) continue;
+          if (ref.kind === 'url') { documents.set(key, { fileUrl: ref.url, filename: 'document.pdf' }); continue; }
+          const encoded = Math.ceil(ref.bytes / 3) * 4;
+          if (ref.bytes > MAX_PDF_BYTES || encoded > budget) { notes.add('request.document_over_budget'); continue; }
+          const store = this.options.attachments?.();
+          if (!store?.readFileStream) { notes.add('request.document_store_missing'); continue; }
+          try {
+            const chunks: Buffer[] = []; let size = 0;
+            for await (const chunk of store.readFileStream({ attachmentId: ref.attachmentId as never, name: ref.name, bytes: ref.bytes }, signal)) {
+              size += chunk.byteLength;
+              if (size > ref.bytes) throw new BridgeError('DOCUMENT_CHANGED', 'stored PDF size changed');
+              chunks.push(Buffer.from(chunk));
+            }
+            const data = Buffer.concat(chunks).toString('base64');
+            budget -= data.length;
+            documents.set(key, { fileData: data, filename: documentFileName(ref.name) });
+          } catch (error) { if (signal.aborted) throw error; notes.add('request.document_read_failed'); }
+        }
+      }
+    }
+    return documents;
+  }
+
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const notes = new Notes(); const started = Date.now();
     const controller = new AbortController(); this.requests.add(controller);
@@ -311,7 +358,18 @@ export class SiwcAdapter extends LlmAdapter {
       const prepared = await this.prepareMedia(options, signal, notes);
       touch();
       const toolNames = new Map<string, string>();
-      response = await this.request('inference', signal, id => buildRequest(prepared.options, { registrationId: id, media: prepared.media, notes, toolNames }), id => { registrationId = id; });
+      const documents = await this.prepareDocuments(prepared.options, signal, notes);
+      const send = (attached: ReadonlyMap<string, RequestDocument>) => this.request('inference', signal,
+        id => buildRequest(prepared.options, { registrationId: id, media: prepared.media, notes, toolNames, documents: attached }), id => { registrationId = id; });
+      try { response = await send(documents); }
+      catch (error) {
+        if (!documents.size || !documentRejected(error)) throw error;
+        // The service could not use an attached PDF: send the turn once more with notes instead,
+        // and stop attaching those PDFs only when that succeeds.
+        notes.add('request.document_rejected');
+        response = await send(new Map());
+        for (const key of documents.keys()) this.failedDocuments.add(key);
+      }
       touch();
       const stream = new ResponseStream(options.model, notes, registrationId, toolNames);
       for await (const event of readSse(response.body ?? new ReadableStream(), signal, notes)) {
