@@ -73,6 +73,23 @@ v0.3.0 より前は `%LOCALAPPDATA%\siwc-bridge-dsh` に保存していました
 - `selected-model.json`：次回起動時の既定モデル
 - `diagnostics.log`：要求ごとの時刻・モデル・結果・HTTP状態・request ID・所要時間と、読み飛ばした通知の種類名。会話の本文、ツールの内容、トークン、サービスのエラー本文は書きません（512 KiBで切り替え）。
 
+## うまく動かないとき
+
+### Pwshツールが「SetNamedSecurityInfoW failed (Win32 5): grantWrite(…)」で失敗する
+
+DSHのWindows用サンドボックスの仕様によるもので、このプラグインとは別の問題です。サンドボックスは、コマンドが書き込める範囲を作業フォルダに設定します。このとき、作業フォルダの「アクセス許可の変更」と「所有者の変更」の権限を使います。
+
+- ユーザーフォルダ（`%USERPROFILE%` の下）では、本人がフルコントロールを持っているので問題ありません。
+- 追加したドライブ（`E:` など）の既定の権限は「Authenticated Users: 変更」です。所有者を変更する権限がないため、失敗します。
+
+DSHに同梱の修復スクリプトを使うと、その作業フォルダだけに本人のフルコントロールを追加できます。変更前の権限を保存し、元に戻すコマンドも表示します。管理者として実行する必要はありません。通常のPowerShellで、このフォルダ（`integrations\dsh`）から実行します。`<作業フォルダ>` は実際のパスに置き換えてください。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\node_modules\@deepseek-ai\dsh-sandbox-windows-acl\assets\diagnose-windows-sandbox-acl\scripts\diagnose-windows-sandbox-acl.ps1 -Path '<作業フォルダ>' -AllowRoot '<作業フォルダ>' -Out '<作業フォルダ>-acl-backup'
+```
+
+権限を変えずに済ませたい場合は、そのセッションの権限を「完全権限（Full access）」に切り替える方法もあります。ただしその間は、コマンドがサンドボックスなしで動き、作業フォルダの外にも書き込めるようになります。
+
 ## テスト
 
 ```powershell
