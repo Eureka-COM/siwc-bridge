@@ -14,14 +14,15 @@ export function apply(ctx, config) {
   const persist = () => writeFileSync(config.evidencePath, JSON.stringify(facts, null, 2) + '\n', 'utf8');
   const timers = new Map();
   persist();
-  ctx.on('agent/created', ({ agent }) => { agent.ctx.tools.restrict({ allow: ['read'] }); });
+  const tool = config.tool ?? 'read';
+  ctx.on('agent/created', ({ agent }) => { agent.ctx.tools.restrict({ allow: [tool] }); });
   ctx.tools.guard(exec => {
     const args = exec.arguments;
-    let accepted = exec.name === 'read' && args && typeof args === 'object' && typeof args.file_path === 'string';
+    let accepted = exec.name === tool && args && typeof args === 'object' && typeof args.file_path === 'string';
     if (accepted) {
       try { accepted = realpathSync(resolve(args.file_path)) === dummy; } catch { accepted = false; }
     }
-    if (!accepted || facts.allowedCalls.length >= config.toolLimit) { facts.denied += 1; persist(); return 'SIWC scenario permits only one read of its dedicated dummy file.'; }
+    if (!accepted || facts.allowedCalls.length >= config.toolLimit) { facts.denied += 1; persist(); return `SIWC scenario permits only one ${tool} of its dedicated dummy file.`; }
     facts.allowedCalls.push({ callId: exec.callId, name: exec.name }); persist();
     return undefined;
   });

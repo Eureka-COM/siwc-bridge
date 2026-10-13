@@ -1,4 +1,5 @@
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 export const name = 'siwc-mock-adapter';
 export const inject = ['llm'];
@@ -24,10 +25,11 @@ export async function apply(ctx, config) {
     facts.requests.push({ body, attribution: headers.has('user-agent') }); persist();
     if (facts.inferenceRequests > 2) throw new Error('Fixture inference budget exceeded.');
     let output; let events;
+    const pdf = config.scenario === 'pdf';
     if (facts.inferenceRequests === 1) {
       const namespace = body.tools?.find(tool => tool.type === 'namespace')?.name;
-      const item = { type: 'function_call', id: 'fc_fixture', status: 'completed', call_id: 'call_fixture', name: 'read',
-        ...(namespace ? { namespace } : {}), arguments: JSON.stringify({ file_path: config.dummyPath, offset: 1, limit: 5 }) };
+      const item = { type: 'function_call', id: 'fc_fixture', status: 'completed', call_id: 'call_fixture', name: pdf ? 'read_pdf' : 'read',
+        ...(namespace ? { namespace } : {}), arguments: JSON.stringify(pdf ? { file_path: config.dummyPath } : { file_path: config.dummyPath, offset: 1, limit: 5 }) };
       output = [item];
       const split = Math.floor(item.arguments.length / 2);
       events = [
@@ -42,7 +44,14 @@ export async function apply(ctx, config) {
     } else {
       const result = body.input.find(item => item.type === 'function_call_output' && item.call_id === 'call_fixture');
       const outputText = typeof result?.output === 'string' ? result.output : JSON.stringify(result?.output);
-      const marker = outputText?.match(/DSH_MOCK_VALUE=[a-f0-9]{32}/)?.[0];
+      let marker;
+      if (pdf) {
+        // The PDF itself must arrive as an input file, byte for byte, with the marker text removed.
+        const file = Array.isArray(result?.output) ? result.output.find(part => part.type === 'input_file') : undefined;
+        const expected = `data:application/pdf;base64,${readFileSync(config.dummyPath).toString('base64')}`;
+        if (file?.file_data !== expected || outputText.includes('[siwc-document')) throw new Error('Second inference did not receive the PDF itself.');
+        marker = `DSH_MOCK_PDF=${createHash('sha256').update(readFileSync(config.dummyPath)).digest('hex').slice(0, 32)}`;
+      } else marker = outputText?.match(/DSH_MOCK_VALUE=[a-f0-9]{32}/)?.[0];
       if (!marker) throw new Error('Second inference did not receive the actual dsh read result.');
       const text = `dsh read result: ${marker}`;
       output = [{ type: 'message', id: 'msg_fixture', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text, annotations: [] }] }];
@@ -68,6 +77,11 @@ export async function apply(ctx, config) {
     async status() { return { activeId: 'mock-registration' }; }
     async withAccessToken(callback) { return callback(fakeToken, undefined, 'mock-registration'); }
   }
-  const adapter = new SiwcAdapter(new FixtureCredentialSource());
+  const adapter = new SiwcAdapter(new FixtureCredentialSource(), { attachments: () => ctx.get('attachments') });
   ctx.llm.registerAdapter([config.provider], adapter);
+  if (config.scenario === 'pdf') {
+    // The plugin's own read_pdf tool, as the real plugin registers it.
+    const { pdfTool } = await import('../../lib/pdf-tool.js');
+    ctx.inject(['tools'], toolCtx => { toolCtx.tools.register(pdfTool({ fs: () => ctx.get('fs'), attachments: () => ctx.get('attachments') })); });
+  }
 }

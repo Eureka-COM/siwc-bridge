@@ -160,7 +160,7 @@ export async function writeRuntimePatch(file, { provider = 'siwc', model, guard,
   if (model) content += `\n- id: agent-default-model\n  config:\n    provider: ${yaml(provider)}\n    model: ${yaml(model)}\n${effort ? `    reasoningEffort: ${yaml(effort)}\n` : ''}`;
   const inserted = [];
   if (guard) inserted.push({ id: 'siwc-test-guard', name: guard.path ?? paths.guardFixture, config: {
-    dummyPath: guard.dummyPath, evidencePath: guard.evidencePath,
+    dummyPath: guard.dummyPath, evidencePath: guard.evidencePath, tool: guard.tool,
     toolLimit: guard.toolLimit ?? 1, maxSteps: guard.maxSteps ?? 2, timeoutMs: guard.timeoutMs ?? 60_000,
   } });
   if (fixture) {

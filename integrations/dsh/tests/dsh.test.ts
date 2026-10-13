@@ -6,7 +6,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { get } from 'node:http';
 import { join } from 'node:path';
 import test from 'node:test';
-import { cleanEnvironment, initializeProfile, paths, resolveDshBin, runDsh, writeIsolationPatch } from '../scripts/dsh-env.mjs';
+import { createHash } from 'node:crypto';
+import { cleanEnvironment, initializeProfile, paths, resolveDshBin, runDsh, samplePdf, writeIsolationPatch } from '../scripts/dsh-env.mjs';
 
 for (const scenario of ['completed', 'disconnected']) {
   test(`実 dsh の SIWC モック ${scenario}: ローカル read と終端判定`, { timeout: 120_000 }, async () => {
@@ -54,6 +55,30 @@ for (const scenario of ['completed', 'disconnected']) {
     console.log(`DSH_MOCK_EVIDENCE: ${folder}`);
   });
 }
+
+test('実 dsh の SIWC モック pdf: read_pdf が DSH の保存領域を通り、PDF そのものを関数結果に添付する', { timeout: 120_000 }, async () => {
+  const runId = randomBytes(6).toString('hex'); const folder = join(paths.work, 'verification', `mock-pdf-${runId}`);
+  await mkdir(folder, { recursive: true }); await mkdir(paths.workspace, { recursive: true });
+  const dummyPath = join(paths.workspace, `${runId}.pdf`); const bytes = samplePdf(`Mock PDF ${runId}`); await writeFile(dummyPath, bytes);
+  const marker = `DSH_MOCK_PDF=${createHash('sha256').update(bytes).digest('hex').slice(0, 32)}`;
+  const home = join(folder, 'dsh-home'); const profile = 'siwc-mock';
+  await initializeProfile(profile, 'headless', { home });
+  const guardEvidence = join(folder, 'guard.json'); const modelEvidence = join(folder, 'requests.json');
+  const patch = join(folder, 'mock.patch.yml');
+  await writeIsolationPatch(patch, { provider: 'siwc', model: 'siwc-mock-model',
+    guard: { dummyPath, evidencePath: guardEvidence, timeoutMs: 45_000, tool: 'read_pdf' },
+    fixture: { evidencePath: modelEvidence, scenario: 'pdf' } });
+  const result = await runDsh(['--profile', profile, '--patch', patch, '--json', `Use read_pdf once on ${dummyPath} and answer with what it says.`], { home, capture: true, timeoutMs: 75_000 });
+  await writeFile(join(folder, 'stdout.jsonl'), result.stdout, 'utf8'); await writeFile(join(folder, 'stderr.txt'), result.stderr, 'utf8');
+  assert.equal(result.code, 0, `dsh failed; evidence: ${folder}\n${result.stderr}`);
+  const guards = JSON.parse(await readFile(guardEvidence, 'utf8')); const requests = JSON.parse(await readFile(modelEvidence, 'utf8'));
+  assert.equal(requests.inferenceRequests, 2); assert.deepEqual(guards.allowedCalls.map((call: { name: string }) => call.name), ['read_pdf']);
+  assert.equal(guards.results[0].isError, false);
+  assert.ok(requests.requests[0].body.tools[0].tools.some((tool: { name: string }) => tool.name === 'read_pdf'), 'read_pdf is offered to the model');
+  const events = result.stdout.split(/\r?\n/).filter(line => line.startsWith('{')).map(line => JSON.parse(line));
+  assert.ok(events.some(event => event.type === 'final' && event.text.includes(marker)));
+  console.log(`DSH_MOCK_EVIDENCE: ${folder}`);
+});
 
 function loopbackGet(url, headers = {}) {
   assert.equal(new URL(url).hostname, '127.0.0.1');
