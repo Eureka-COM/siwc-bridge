@@ -223,3 +223,23 @@ test('tool names the service does not accept are sent under a stable alias and m
   const chunks = stream.accept({ type: 'response.completed', response: { status: 'completed', output: [] } });
   assert.equal((chunks.find(chunk => chunk.type === 'block-end') as any).block.name, original);
 });
+
+// ---------- release of tool calls (only whole, offered calls of a completed response) ----------
+
+test('tools are released only from a whole response: offered name, own namespace, completed call, JSON-object arguments', () => {
+  const offered = new Set(['read']);
+  const release = (output: unknown[], status: string | undefined = 'completed') =>
+    new ResponseStream(model, new Notes(), 'reg-a', new Map(), offered).accept({ type: 'response.completed', response: { ...(status ? { status } : {}), output } });
+  assert.equal((release([call()]).at(-1) as any).reason.kind, 'tool-calls');
+  for (const [bad, reason] of [[{ ...call(), name: 'write' }, 'not_offered'], [{ ...call(), namespace: 'other' }, 'other_namespace'], [{ ...call(), status: 'in_progress' }, 'not_completed'],
+    [call('call_1', '{"path":'), 'arguments_not_json'], [call('call_1', '["a"]'), 'arguments_not_object']] as const) {
+    assert.throws(() => release([message('text'), bad]), (error: any) => error.code === 'INVALID_TOOL_CALL' && error.message.includes(reason), reason);
+  }
+  // response.completed whose response is not completed never releases tools.
+  assert.throws(() => release([call()], 'failed'), { code: 'RESPONSE_INCOMPLETE' });
+  assert.throws(() => release([call()], 'incomplete'), (error: any) => error.code === 'RESPONSE_INCOMPLETE');
+  // A call that was started but never finished withholds the answer's tools.
+  const stream = new ResponseStream(model, new Notes(), 'reg-a', new Map(), offered);
+  stream.accept({ type: 'response.output_item.added', output_index: 0, item: { ...call(), status: 'in_progress', arguments: '' } });
+  assert.throws(() => stream.accept(completed([])), (error: any) => error.code === 'INVALID_TOOL_CALL' && error.message.includes('not_done'));
+});

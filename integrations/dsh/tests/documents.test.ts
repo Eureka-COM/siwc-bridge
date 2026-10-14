@@ -55,7 +55,9 @@ const completed = () => new Response(['{"type":"response.output_text.delta","out
   '{"type":"response.completed","response":{"status":"completed","output":[]}}'].map(line => `data: ${line}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
 async function run(adapter: SiwcAdapter, request: GenerateOptions) { for await (const _chunk of adapter.stream(request)) { /* drain */ } }
 
-test('the adapter attaches stored PDFs from DSH’s attachment store, and a PDF the service refuses is replaced by a note for the rest of the session', async t => {
+const inSession = (sessionId: string, request: GenerateOptions) => ({ ...request, sessionId } as GenerateOptions);
+
+test('a refused PDF is skipped only in its own conversation, and only when the refusal points at it; the other PDFs stay attached', async t => {
   const bodies: any[] = []; let refuse = true;
   t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body)); bodies.push(body);
@@ -64,18 +66,34 @@ test('the adapter attaches stored PDFs from DSH’s attachment store, and a PDF 
   });
   const attachments = store();
   const adapter = new SiwcAdapter(credentials, { attachments: () => attachments as never });
-  const request = conversation(call('c1', 'read_pdf'), result('c1', fileText), call('c2', 'read_pdf'), result('c2', urlText));
+  const request = inSession('session-a', conversation(call('c1', 'read_pdf'), result('c1', fileText), call('c2', 'read_pdf'), result('c2', urlText)));
   await run(adapter, request);
   assert.equal(bodies.length, 2, 'refused once, then sent again without the PDFs');
   assert.ok(JSON.stringify(bodies[0]).includes('file_data') && JSON.stringify(bodies[0]).includes('file_url'));
   assert.equal(JSON.stringify(bodies[1]).includes('input_file'), false);
   assert.match(JSON.stringify(bodies[1]), /could not be attached/);
-  assert.deepEqual(attachments.reads, [attachmentId]);
-  refuse = false; await run(adapter, request);
-  assert.equal(JSON.stringify(bodies[2]).includes('input_file'), false, 'refused PDFs are not attached again');
-  const fresh = new SiwcAdapter(credentials, { attachments: () => attachments as never });
-  await run(fresh, conversation(call('c1', 'read_pdf'), result('c1', fileText)));
-  assert.ok(JSON.stringify(bodies[3]).includes(`"file_data":"data:application/pdf;base64,${pdf.toString('base64')}"`));
+  await run(adapter, request);
+  assert.equal(JSON.stringify(bodies[2]).includes('file_url'), false, 'the refused URL is not sent again in this conversation');
+  assert.ok(JSON.stringify(bodies[2]).includes(`"file_data":"data:application/pdf;base64,${pdf.toString('base64')}"`), 'the good PDF is still attached');
+  refuse = false;
+  await run(adapter, inSession('session-b', request));
+  assert.ok(JSON.stringify(bodies[3]).includes('file_url') && JSON.stringify(bodies[3]).includes('file_data'), 'another conversation attaches both');
+  assert.equal(attachments.reads.length, 3);
+});
+
+test('a refusal that does not identify one PDF costs only that request its PDFs', async t => {
+  const second = pdfResultText({ source: 'url', url: 'https://example.org/second.pdf' });
+  const bodies: any[] = []; let refuse = true;
+  t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)); bodies.push(body);
+    if (refuse && JSON.stringify(body).includes('file_url')) { refuse = false; return Response.json({ error: { code: 'invalid_value', param: 'url' } }, { status: 400 }); }
+    return completed();
+  });
+  const adapter = new SiwcAdapter(credentials, { attachments: () => store() as never });
+  const request = inSession('session-a', conversation(call('c1', 'read_pdf'), result('c1', urlText), call('c2', 'read_pdf'), result('c2', second)));
+  await run(adapter, request);
+  await run(adapter, request);
+  assert.equal(JSON.stringify(bodies[2]).split('file_url').length - 1, 2, 'both URLs are attached again on the next request');
 });
 
 test('an unrelated 400 is not blamed on the PDF: it fails the turn and the PDF stays attachable', async t => {

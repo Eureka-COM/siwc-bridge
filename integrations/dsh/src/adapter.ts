@@ -88,6 +88,7 @@ export function classify(error: unknown, signal?: AbortSignal): LlmError {
     : error.code === 'context_length_exceeded' || isContextWindowExceededError(error.code) ? 'CONTEXT_WINDOW_EXCEEDED'
     : error.code === 'subscription_sharing_unsupported_capability' ? 'UNSUPPORTED_OPTION'
     : ['STREAM_INTERRUPTED', 'TRANSPORT', 'RESPONSE_INCOMPLETE'].includes(error.code) ? 'TRANSPORT'
+    : error.code === 'INVALID_TOOL_CALL' ? 'SERVER'
     : RETRYABLE_SERVICE.has(error.code) || (status !== undefined && status >= 500) ? 'SERVER'
     : status === 429 ? 'RATE_LIMIT'
     : SIGN_IN.has(error.code) || status === 401 ? 'AUTH'
@@ -104,8 +105,19 @@ function documentRejected(error: unknown): boolean {
 
 export class SiwcAdapter extends LlmAdapter {
   private paused = false;
-  /** PDFs the service refused in this process; later requests send a note instead. */
-  private readonly failedDocuments = new Set<string>();
+  /**
+   * PDFs the service refused, per conversation, recorded only when the refusal identifies the
+   * file. Other conversations and registrations still attach them.
+   */
+  private readonly failedDocuments = new Map<string, Set<string>>();
+  private failedFor(conversation: string): Set<string> {
+    let set = this.failedDocuments.get(conversation);
+    if (!set) {
+      if (this.failedDocuments.size >= 200) this.failedDocuments.delete(this.failedDocuments.keys().next().value!);
+      set = new Set(); this.failedDocuments.set(conversation, set);
+    }
+    return set;
+  }
   private readonly requests = new Set<AbortController>();
   private catalog?: { provider: string; registrationId: string; expiresAt: number; models: readonly LlmModelInfo[] };
   private catalogGeneration = 0;
@@ -304,7 +316,7 @@ export class SiwcAdapter extends LlmAdapter {
    * PDFs recorded by read_pdf results, newest first within the request budget. A URL is
    * downloaded by the service; a stored file is read back from DSH's attachment store.
    */
-  private async prepareDocuments(options: GenerateOptions, signal: AbortSignal, notes: Notes): Promise<Map<string, RequestDocument>> {
+  private async prepareDocuments(options: GenerateOptions, signal: AbortSignal, notes: Notes, failed: ReadonlySet<string>): Promise<Map<string, RequestDocument>> {
     const documents = new Map<string, RequestDocument>();
     const names = new Map<string, string>();
     for (const message of options.messages) if (message.role === 'assistant') for (const block of message.content) if (block.type === 'tool-call') names.set(block.id, block.name);
@@ -315,7 +327,7 @@ export class SiwcAdapter extends LlmAdapter {
         if (block.type !== 'text') continue;
         for (const ref of parseDocuments(block.text).refs) {
           const key = documentKey(ref);
-          if (documents.has(key) || this.failedDocuments.has(key)) continue;
+          if (documents.has(key) || failed.has(key)) continue;
           if (ref.kind === 'url') { documents.set(key, { fileUrl: ref.url, filename: 'document.pdf' }); continue; }
           const encoded = Math.ceil(ref.bytes / 3) * 4;
           if (ref.bytes > MAX_PDF_BYTES || encoded > budget) { notes.add('request.document_over_budget'); continue; }
@@ -358,9 +370,11 @@ export class SiwcAdapter extends LlmAdapter {
       const prepared = await this.prepareMedia(options, signal, notes);
       touch();
       const toolNames = new Map<string, string>();
-      const documents = await this.prepareDocuments(prepared.options, signal, notes);
+      const offered = new Set<string>();
+      const conversation = typeof (options as { sessionId?: unknown }).sessionId === 'string' ? String((options as { sessionId?: unknown }).sessionId) : '';
+      const documents = await this.prepareDocuments(prepared.options, signal, notes, this.failedDocuments.get(conversation) ?? new Set());
       const send = (attached: ReadonlyMap<string, RequestDocument>) => this.request('inference', signal,
-        id => buildRequest(prepared.options, { registrationId: id, media: prepared.media, notes, toolNames, documents: attached }), id => { registrationId = id; });
+        id => buildRequest(prepared.options, { registrationId: id, media: prepared.media, notes, toolNames, offered, documents: attached }), id => { registrationId = id; });
       try { response = await send(documents); }
       catch (error) {
         if (!documents.size || !documentRejected(error)) throw error;
@@ -368,13 +382,25 @@ export class SiwcAdapter extends LlmAdapter {
         // and stop attaching those PDFs only when that succeeds.
         notes.add('request.document_rejected');
         response = await send(new Map());
-        for (const key of documents.keys()) this.failedDocuments.add(key);
+        // Only a file the refusal points at is skipped later, and only in this conversation;
+        // an unattributable refusal costs this request its PDFs and nothing more.
+        const suspects = [...documents.entries()].filter(([, document]) => /url/i.test((error as ProviderFailure).param ?? '') ? document.fileUrl !== undefined
+          : /file_data|filename/i.test((error as ProviderFailure).param ?? '') ? document.fileData !== undefined : true);
+        if (suspects.length === 1) { this.failedFor(conversation).add(suspects[0]![0]); notes.add('request.document_skipped_later'); }
       }
       touch();
-      const stream = new ResponseStream(options.model, notes, registrationId, toolNames);
+      const stream = new ResponseStream(options.model, notes, registrationId, toolNames, offered);
       for await (const event of readSse(response.body ?? new ReadableStream(), signal, notes)) {
         touch();
-        for (const chunk of stream.accept(event)) yield chunk;
+        const chunks = stream.accept(event);
+        // Before the completed answer (and its tool calls) is released, confirm no sign-out or
+        // account switch in any process cancelled this request in the meantime.
+        if (stream.completed) await scope?.check?.();
+        for (const chunk of chunks) {
+          // A cancel during the release of a completed answer stops before the next chunk.
+          signal.throwIfAborted();
+          yield chunk;
+        }
         if (stream.completed) break;
       }
       stream.end();

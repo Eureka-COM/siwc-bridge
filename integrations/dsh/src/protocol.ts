@@ -84,6 +84,8 @@ export interface BuildContext {
   documents?: ReadonlyMap<string, RequestDocument>;
   /** Filled by buildRequest: function name sent to the service → DSH tool name. */
   toolNames?: Map<string, string>;
+  /** Filled by buildRequest: every function name offered in this request. */
+  offered?: Set<string>;
 }
 
 /**
@@ -249,7 +251,7 @@ export function buildRequest(options: GenerateOptions, context: BuildContext = {
     const tools = options.tools.flatMap(tool => {
       const wire = wireToolName(tool.name);
       if (names.has(wire)) { context.notes?.add('request.duplicate_tool_skipped'); return []; }
-      names.add(wire);
+      names.add(wire); context.offered?.add(wire);
       if (wire !== tool.name) { context.toolNames?.set(wire, tool.name); context.notes?.add('request.tool_name_aliased'); }
       return [{ type: 'function', name: wire, description: tool.description ?? '', parameters: object(tool.parameters) ? tool.parameters : { type: 'object', properties: {} }, strict: false }];
     });
@@ -336,6 +338,10 @@ const IGNORED_EVENTS = new Set(['response.created', 'response.in_progress', 'res
  * - Events this adapter does not use are skipped (and noted), so new service
  *   events never fail a turn. Success still requires response.completed.
  */
+function invalidCall(reason: string): BridgeError {
+  return new BridgeError('INVALID_TOOL_CALL', `ChatGPTから不正なツール呼び出しが返ったため、この応答のツールは実行しません（${reason}）。`);
+}
+
 export class ResponseStream {
   private readonly items = new Map<number, Item>();
   private readonly texts = new Map<string, Block>();
@@ -343,7 +349,7 @@ export class ResponseStream {
   private nextIndex = 0;
   completed = false;
   constructor(private readonly model: string, private readonly notes = new Notes(), private readonly registrationId?: string,
-    private readonly toolNames: ReadonlyMap<string, string> = new Map()) {}
+    private readonly toolNames: ReadonlyMap<string, string> = new Map(), private readonly offered?: ReadonlySet<string>) {}
 
   private append(map: Map<string, Block>, key: string, kind: 'text' | 'reasoning', delta: string): StreamChunk[] {
     const chunks: StreamChunk[] = [];
@@ -424,8 +430,12 @@ export class ResponseStream {
   private complete(event: Record<string, unknown>): StreamChunk[] {
     const response = object(event.response) ? event.response : {};
     if (response.error !== undefined && response.error !== null) throw providerFailure(response);
+    // The event name alone is not enough: an answer that did not finish never releases tools.
+    if (response.status === 'incomplete') return this.incomplete(event);
+    if (response.status !== undefined && response.status !== 'completed') throw new BridgeError('RESPONSE_INCOMPLETE', `ChatGPTの応答が完了しませんでした（${label(response.status, 40) ?? 'unknown'}）。`);
     const reported = Array.isArray(response.output) ? response.output.filter(object) : [];
     // The final response is authoritative; when it is empty, finished stream items are used.
+    if (reported.length === 0 && [...this.items.values()].some(item => !item.done && item.added.type === 'function_call')) throw invalidCall('not_done');
     const output: Record<string, unknown>[] = reported.length > 0 ? reported.map(item => structuredClone(item))
       : [...this.items.entries()].sort(([a], [b]) => a - b).flatMap(([, item]) => item.done ? [item.done] : []);
     // The ChatGPT-plan route normally sends an empty final output; the finished items are the answer.
@@ -445,14 +455,24 @@ export class ResponseStream {
           else if (streamed.text !== full) this.notes.add('stream.final_text_differs');
         }
       } else if (item.type === 'function_call') {
+        // A call acts on the user's behalf, so it is released only when it is whole and was offered:
+        // completed, in this integration's namespace, a name sent in this request, JSON-object arguments.
+        // Any other call withholds every tool of this answer (DSH retries the request).
         const id = text(item.call_id) && item.call_id !== '' ? item.call_id : undefined;
-        const name = text(item.name) && item.name !== '' ? this.toolNames.get(item.name) ?? item.name : undefined;
-        if (!id || !name) { this.notes.add('stream.call_without_id_or_name'); continue; }
+        const wire = text(item.name) && item.name !== '' ? item.name : undefined;
+        if (!id || !wire) throw invalidCall('without_id_or_name');
+        if (item.status !== undefined && item.status !== 'completed') throw invalidCall('not_completed');
+        if (item.namespace !== undefined && item.namespace !== TOOL_NAMESPACE) throw invalidCall('other_namespace');
+        if (this.offered && !this.offered.has(wire)) throw invalidCall('not_offered');
         if (seen.has(id)) { this.notes.add('stream.duplicate_call'); continue; }
         seen.add(id);
         const streamedArgs = [...this.items.values()].find(entry => entry.added.call_id === id)?.args;
         const args = text(item.arguments) ? item.arguments : streamedArgs ?? '';
-        calls.push({ id, name, arguments: args === '' ? '{}' : args });
+        const value = args === '' ? '{}' : args;
+        let parsed: unknown;
+        try { parsed = JSON.parse(value); } catch { throw invalidCall('arguments_not_json'); }
+        if (!object(parsed)) throw invalidCall('arguments_not_object');
+        calls.push({ id, name: this.toolNames.get(wire) ?? wire, arguments: value });
       } else if (item.type === 'reasoning') {
         // Summaries normally stream; when they did not, show the final summary once.
         if (!this.summaries.has(`${outputIndex}`) && Array.isArray(item.summary)) {

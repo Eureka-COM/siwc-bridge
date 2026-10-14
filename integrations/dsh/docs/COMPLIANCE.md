@@ -1,10 +1,10 @@
 # 仕様照合と依存の採否
 
-取得日: 2026-10-09 JST（2026-10-11 追記）。参照した公開資料・ソースは配布物へコピーしていません。本書は公認・規約適合・法的安全性の保証書ではありません。
+取得日: 2026-10-09 JST（2026-10-11、2026-10-14 追記）。参照した公開資料・ソースは配布物へコピーしていません。本書は公認・規約適合・法的安全性の保証書ではありません。
 
-実アプリ名は `SIWC Bridge for DSH`、保存先は `%USERPROFILE%\.siwc-bridge\apps\siwc-bridge-dsh` の専用フォルダです（v0.3.0 より前は `%LOCALAPPDATA%\siwc-bridge-dsh`。同じアプリの以前の保存場所からだけ、一度移します）。このリポジトリの検証では実ログイン・実モデル要求を行っていません。
+実アプリ名は `SIWC Bridge for DSH`、保存先は `%USERPROFILE%\.siwc-bridge\apps\siwc-bridge-dsh` の専用フォルダです（v0.3.0 より前は `%LOCALAPPDATA%\siwc-bridge-dsh`。同じアプリの以前の保存場所からだけ、一度移します）。v0.3.0 では開発者のWindows PCで実ログイン・実モデル要求による通しテストを行っています（[検証記録](VERIFICATION.md)）。
 
-公開版では、ChatGPT の利用上限・利用枠不明のエラーを受けた場合、共有要求記録の開始許可を OFF にし、停止前のモードを保存します。再起動や `/siwc resume` だけでは再開しません。本人が公式 Usage の設定を保存・確認し `/siwc resume confirmed`、または CLI `resume` で `START` を入力した場合にだけ、停止前のモードを復元します。要求累計をリセットせず、検証の6要求上限も保持します。未開始・使い切った検証は復旧で迂回しません。`live-test -- --begin` による新しい検証も、残りが2要求未満ならツール往復を開始しません。
+利用上限（`subscription_sharing_usage_limit_exceeded`）を受けた場合、DSH接続はそのDSHプロセス内で新しい要求（推論・Web検索）を止め、Manage usage へ案内します。本人が確認して `/siwc resume` を実行すると再開します。この停止はプロセス内だけのもので、DSHを再起動すると解除されます。共有の要求記録・開始許可・要求数の上限による停止は SDK（`RequestBudget`）の機能で、DSH接続は使いません。
 
 | ID | 確認した一次資料と関連節 | 状態・実装対応 |
 |---|---|---|
@@ -12,8 +12,8 @@
 | S02 | [Registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in) / 1〜5 | 確認済み。auth.tsのdynamic_agent_client→issued client、nonce/state/PKCE、127.0.0.1、returned scope、identity一致 |
 | S03 | [Accounts and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions) / accounts、refresh、end session、security | 確認済み。登録分離、CurrentUser DPAPI、FileShare.None排他、refresh/remote revocation、host mapping保持 |
 | S04 | [Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference) / catalog、Responses、completed | 確認済み。adapter.ts固定public URL、models array/visibility/slug/order、protocol.ts完了判定 |
-| S05 | [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) / requirements、tools、unsupported fields | 確認済み。allowlist、namespace、full history、system→developer、未対応引数拒否 |
-| S06 | [Errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery) / admission、structured errors、refresh | 確認済み。detail/structured分類、code/param/request ID、limit latch、retry0、終端失効だけtoken clear |
+| S05 | [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) / requirements、tools、unsupported fields | 確認済み。namespaceに入れたfunction tool、full history、system→developer。未対応の引数（temperature等）は送らずに続行（拒否しない）。ツール呼び出しは、今回の要求で提示した名前・同じnamespace・完了状態・JSONオブジェクトの引数が揃ったものだけを渡す（スキーマ全体の検査はDSHが行う） |
+| S06 | [Errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery) / admission、structured errors、refresh | 確認済み。detail/structured分類、code/param/request ID、利用上限ではプロセス内で停止。一時的な障害（5xx・切断・利用枠確認不能など）はDSHの再試行機能で最大4回、間隔を空けて再試行。終端失効だけtoken clear |
 | S07 | [Token reference](https://developers.openai.com/siwc/token-sharing-open-source/token-reference) / response、lifetime | 確認済み。expires_in保存、refresh rotation、scope原子的更新。auth metadataは不透明 |
 | S08 | [UI/UX guidelines](https://developers.openai.com/siwc/ui-ux-guidelines) / first use、usage、in use、limit | 確認済み。index.tsの既存/siwc commands、初回confirm、公式Usageリンク。画面実機確認は未完了 |
 | S09 | [SIWC Terms](https://openai.com/policies/sign-in-with-chatgpt-terms/) / 2026-09-29版 | 確認済み。本人のlocal利用、無料配布、privacy notice、制限回避禁止。SIWC software改変の解釈を自己判断で確定しない |
@@ -35,10 +35,10 @@ namespace／stream itemの型は[OpenAI公開SDK Responses types](https://github
 
 630 lock項目でinstall scriptが宣言されたのはdsh-subprocess-local、google/genai、koffi、node-pty、protobufjs。manifestの役割を確認し、すべて--ignore-scriptsで導入しました。ソースdsh rootのhooksを書き換えるpostinstallは実行しません。公開候補にnode_modules・SDKソース・個人状態・ブランドassetは含めません。
 
-未確認: 実アカウントでの推論、公式Usage画面での計上・クレジット残高・請求、実サービスのrefresh/失効の全ケース、別のWindowsユーザー/端末。ローカルテストの合格はこれらの保証になりません。
+未確認: 公式Usage画面での計上・クレジット残高・請求、実サービスのrefresh/失効の全ケース、別のWindowsユーザー/端末。実アカウントでの推論は開発者のPCで確認済みですが、ローカルテストや一度の通しテストの合格はこれらの保証になりません。
 
-クレジットについて: S14の「Let apps use credits after reaching plan limits」は、アプリ上限100%未満でクレジット使用を防ぎ、クレジット利用許可と自動購入が別設定と明記します。利用者は公式 Usage の `SIWC Bridge for DSH` で自分の保存済み設定を確認します。公開推論引数にプラン枠だけを強制する項目はありません。設定を推測したり変更する私有APIを追加せず、本人確認を開始条件にします。利用計上と請求は別の未確認項目です。
+クレジットについて: S14の「Let apps use credits after reaching plan limits」は、アプリ上限100%未満でクレジット使用を防ぎ、クレジット利用許可と自動購入が別設定と明記します。利用者は公式 Usage の `SIWC Bridge for DSH` で自分の保存済み設定を確認します。公開推論引数にプラン枠だけを強制する項目はありません。設定を推測したり変更する私有APIを追加しません。初回サインイン時に、この設定を確認するよう一度だけ案内します（READMEにも記載）。利用計上と請求は別の未確認項目です。
 
 Web署名secretは追加host peer `@deepseek-ai/dsh-credentials`0.2.1-alpha.1（MIT、公開CredentialProvider、install script無し）の9methodsを最小実装し、唯一のbrowser-session recordをprocessメモリで保持します。公開Web runtimeのprintUrl=falseを使用します。DPAPIのOAuth保存と分離し、再起動時の旧Web Cookie失効を確認します。
 
-実サービスでの仕様差: 開発時に確認したpublic Responses HTTP/SSEでは完成済みoutput_item.doneの後、response.completed.outputが空配列でした。SDKの最終response集約例と同じと仮定せず、[公式Function calling Streaming](https://developers.openai.com/api/docs/guides/function-calling#streaming)のイベントから完成callを集約する手順と、公開SDKのreasoning item.done保持契約に基づいて独立クライアントを実装しました。技術判断として、空の終端配列の場合は連続した全indexの完成itemだけを使い、全schema・引数断片・call ID・opaque dataを検査し、正常response.completed後にだけツールを渡します。非空終端との不一致・missing done・failed・incomplete・切断は拒否します。本文やtokenを診断へ出しません。このリポジトリでの検証は合成 SSE を使うモックです。
+実サービスでの仕様差: ChatGPTプランの経路では、完成したitemは `output_item.done` で届き、`response.completed` の `output` は空配列でした。[公式Function calling Streaming](https://developers.openai.com/api/docs/guides/function-calling#streaming)のイベントから完成itemを集約します。成功は `response.completed`（response.statusが完了）を受けたときだけです。終端の `output` が空の場合は `output_item.done` で完成したitemを使い、開始したまま完成しなかったツール呼び出しがあれば、その応答のツールは渡しません。ツール呼び出しは、完了状態・このDSH接続のnamespace・今回提示した名前・JSONオブジェクトの引数がすべて揃ったときだけDSHへ渡し、1件でも欠ければその応答のツールをすべて渡さず（DSHの再試行に任せ）ます。引数の内容（スキーマ）の検査と実行の承認はDSHのツール実行側が行います。本文以外の通知は読み飛ばして種類名だけを診断ログに残し、本文やtokenは診断へ出しません。

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { BlockAssembler, IMAGE_OFFLOAD_REQUIRED_CODE, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
 import { SiwcAdapter, IMAGE_POLICY, requestImageSize } from '../lib/adapter.js';
-import { safeFailure } from '../lib/errors.js';
+import { BridgeError, safeFailure } from '../lib/errors.js';
 import type { Diagnostics } from '../lib/diagnostics.js';
 
 const model = 'gpt-6.1-sol';
@@ -95,6 +95,27 @@ test('HTTP and transport failures map to DSH routing codes', async t => {
   await assert.rejects(run(adapter(), options()), { code: 'TRANSPORT' });
   response = () => new Response('data: {"type":"response.output_text.delta","output_index":0,"delta":"partial"}\n\n', { headers: { 'content-type': 'text/event-stream' } });
   await assert.rejects(run(adapter(), options()), { code: 'TRANSPORT' });
+});
+
+test('a cancel while a completed answer is being released stops before its tool calls and finish reach DSH', async t => {
+  const toolCall = { type: 'function_call', id: 'fc_1', call_id: 'call_1', namespace: 'dsh', name: 'read', arguments: '{"path":"a.txt"}', status: 'completed' };
+  const sse2 = () => sse({ type: 'response.output_item.done', output_index: 0, item: toolCall }, { type: 'response.completed', response: { status: 'completed', output: [] } });
+  mockFetch(t, () => sse2());
+  const request = options({ tools: [{ name: 'read', description: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }] });
+  for (const how of ['cancelRequests', 'caller', 'other-process'] as const) {
+    const caller = new AbortController(); let revoked = false;
+    const source = { ...credentials(), openRequestScope: async () => ({ signal: new AbortController().signal, close() {}, check: async () => { if (revoked) throw new BridgeError('cancelled', 'cancelled'); } }) };
+    const adapter = new SiwcAdapter(source as never);
+    if (how === 'other-process') revoked = true;
+    const seen: StreamChunk[] = [];
+    const drain = (async () => { for await (const chunk of adapter.stream({ ...request, signal: caller.signal })) { seen.push(chunk); if (how === 'cancelRequests') adapter.cancelRequests(); if (how === 'caller') caller.abort(); } })();
+    await assert.rejects(drain, (error: any) => error.code === 'ABORTED', how);
+    assert.equal(seen.some(chunk => chunk.type === 'finish'), false, how);
+    assert.equal(seen.some(chunk => chunk.type === 'block-end'), false, `${how}: no complete tool call reached DSH`);
+  }
+  // Without a cancel, the same answer releases its tool call.
+  const chunks = await run(new SiwcAdapter(credentials()), request);
+  assert.equal((chunks.at(-1) as any).reason.kind, 'tool-calls');
 });
 
 test('a stalled stream is abandoned as a retryable TIMEOUT; caller cancellation is ABORTED', async t => {
